@@ -1,6 +1,6 @@
 const cron = require('node-cron');
 const pool = require('../config/dbAventuraTime');
-const { downloadAttendance, processAllAttendances, processAllNightShifts, init_week_attendance,
+const { downloadAttendance, processAllAttendances, processAllNightShifts, init_week_attendance, update_week_attendance, init_month_attendance,
     processMonthlyAttendance, classifyAllPunchesWithLogs } = require('./attendanceService');
 
 
@@ -19,8 +19,10 @@ async function runAttendanceJob() {
     updateAttendanceSummary(); // Mettre à jour les données après chaque Téléchargement de pointage
 }
 
-//cron.schedule('41 16 * * *', processMonthlyAttendance ); // Appel des pointage dans attendance_summary
-cron.schedule('13 17 * * *', init_week_attendance ); // Appel de creation des weekly attendance
+
+cron.schedule('42 9 * * *', init_week_attendance ); // Appel de creation des weekly attendance
+cron.schedule('57 9 * * *', update_week_attendance ); // Appel de creation des weekly attendance
+cron.schedule('37 9 * * *', init_month_attendance ); // Appel de creation des weekly attendance
 
 //  (Intervale de temps pour télécharger le pointage !)
 

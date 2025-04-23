@@ -1,4 +1,5 @@
 const Attendance = require("../models/Attendances");
+const Notification = require("../models/Notification");
 const pool = require('../config/db'); // Connexion PostgreSQL
 const xlsx = require('xlsx');
 const fs = require('fs');
@@ -274,21 +275,120 @@ exports.getAttendanceStats = async (req, res) => {
     });
   }
 };
-/* Supprimer un pointage :::::: à voir
-exports.deleteDepartment = async (req, res) => {
+
+/* Fonction pour récupérer les données hebdomadaires
+exports.getWeeklyAttendance = async (req, res) => {
+  const { start_date, end_date, employee_id } = req.query;
+  
   try {
-    const department = await Department.findByPk(req.params.id);
-    if (!department) {
-      return res.status(404).json({ error: "Department not found" });
-    }
-    await department.destroy();
-    res.json({ message: "Department deleted" });
+      let query = `
+          SELECT wa.*, e.name, e.attendance_id 
+          FROM week_attendance wa
+          JOIN employees e ON wa.employee_id = e.attendance_id
+          WHERE 1=1
+      `;
+      const params = [];
+      
+      if (start_date && end_date) {
+          query += ` AND wa.start_date >= $${params.length + 1} AND wa.end_date <= $${params.length + 2}`;
+          params.push(start_date, end_date);
+      }
+      
+      if (employee_id) {
+          query += ` AND wa.employee_id = $${params.length + 1}`;
+          params.push(employee_id);
+      }
+      
+      query += ` ORDER BY e.name, wa.start_date`;
+      
+      const { rows } = await pool.query(query, params);
+      
+      res.json({
+          success: true,
+          data: rows
+      });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+      res.status(500).json({
+          success: false,
+          message: 'Erreur lors de la récupération des données hebdomadaires'
+      });
   }
 };   */
 
-// Corriger un pointage 
+// Fonction pour récupérer les données hebdomadaires et quotidiennes
+exports.getWeeklyAttendance = async (req, res) => {
+  const { start_date, end_date, employee_id } = req.query;
+  
+  try {
+      // Requête pour les données hebdomadaires
+      let weeklyQuery = `
+          SELECT 
+              wa.*, 
+              e.name, 
+              e.attendance_id,
+              e.payroll_id,
+              json_agg(
+                  CASE WHEN asum.date IS NOT NULL THEN
+                      json_build_object(
+                          'date', asum.date,
+                          'hours_worked', asum.hours_worked,
+                          'missed_hour', asum.missed_hour,
+                          'penalisable', asum.penalisable,
+                          'sup_hour', asum.sup_hour,
+                          'jc_value', asum.jc_value,
+                          'jcx_value', asum.jcx_value,
+                          'worked_hours_on_holidays', asum.worked_hours_on_holidays,
+                          'night_hours', asum.night_hours,
+                          'sunday_hour', asum.sunday_hour
+                      )
+                  ELSE NULL END
+              ) FILTER (WHERE asum.date IS NOT NULL) AS daily_data
+          FROM week_attendance wa
+          JOIN employees e ON wa.employee_id = e.attendance_id
+          LEFT JOIN attendance_summary asum ON 
+              asum.employee_id = e.attendance_id AND
+              asum.date BETWEEN wa.start_date AND wa.end_date
+          WHERE 1=1
+      `;
+      
+      const params = [];
+      
+      if (start_date && end_date) {
+          weeklyQuery += ` AND wa.start_date >= $${params.length + 1} AND wa.end_date <= $${params.length + 2}`;
+          params.push(start_date, end_date);
+      }
+      
+      if (employee_id) {
+          weeklyQuery += ` AND wa.employee_id = $${params.length + 1}`;
+          params.push(employee_id);
+      }
+      
+      weeklyQuery += ` 
+          GROUP BY wa.id, e.name, e.attendance_id, e.payroll_id
+          ORDER BY e.name, wa.start_date
+      `;
+      
+      const { rows } = await pool.query(weeklyQuery, params);
+      
+      // Structurer les données pour la réponse
+      const result = rows.map(row => ({
+          ...row,
+          daily_data: row.daily_data || [] // Assure un tableau vide si pas de données quotidiennes
+      }));
+      
+      res.json({
+          success: true,
+          data: result
+      });
+  } catch (error) {
+      console.error('Error fetching weekly attendance:', error);
+      res.status(500).json({
+          success: false,
+          message: 'Erreur lors de la récupération des données',
+          error: error.message
+      });
+  }
+};
 
 exports.updateAttendance = async (req, res) => {
   try {
@@ -428,6 +528,45 @@ exports.getAttendanceSummary = async (req, res) => {
   }
 };
 
+// Récupérer les pointages avec les données 
+exports.getWeekAttendanceSummary = async (req, res) => {
+  try {
+      const { employee_id } = req.query;
+
+      // 1️⃣ Construire la requête SQL de base
+      let query = `
+          SELECT 
+              *
+          FROM week_attendance_summary
+          WHERE 1 = 1
+      `;
+
+      const params = [];
+
+      // 2️⃣ Ajouter un filtre par employee_id si fourni
+      if (employee_id) {
+          query += ` AND employee_id = $${params.length + 1}`;
+          params.push(employee_id);
+      }
+
+      // 3️⃣ Trier les résultats par date décroissante et employee_id croissant
+      query += ` ORDER BY start_date DESC, employee_id ASC`;
+
+      // 4️⃣ Exécuter la requête
+      const result = await pool.query(query, params);
+
+      if (!result || !result.rows.length) {
+          return res.status(404).json({ message: "Aucune donnée trouvée." });
+      }
+
+      // 5️⃣ Retourner les résultats formatés
+      res.status(200).json(result.rows);
+  } catch (error) {
+      console.error('❌ Erreur lors de la récupération des données :', error);
+      res.status(500).json({ error: 'Erreur serveur lors de la récupération des données.' });
+  }
+};
+
 // Ajout de Pointage manuel
 exports.addManualAttendance = async (req, res) => {
   try {
@@ -467,6 +606,174 @@ exports.addManualAttendance = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+
+// Récupérer les stats depuis table monthly_attendance pour le tableau de bord
+exports.getDashboardDatas = async (req, res) => {
+  try {
+    const { employee_id } = req.params;
+    const { start_date, end_date } = req.query;
+
+    // Par défaut : mois en cours
+    const startDate = start_date || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const endDate = end_date || new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0);
+
+
+    // Construction de la requête SQL
+    let query = `
+      SELECT
+        SUM(total_nbr_abs) AS total_absence,
+        SUM(total_conge) AS total_conges,
+        SUM(total_accident) AS total_accident
+      FROM monthly_attendance s
+      WHERE s.month_start BETWEEN $1 AND $2
+    `;
+
+    const params = [startDate, endDate];
+
+    if (employee_id) {
+      query += ` AND s.employee_id = $3`;
+      params.push(employee_id);
+    }
+
+    // Exécution de la requête
+    const { rows } = await pool.query(query, params);
+    const result = rows[0];
+
+    // Calcul des taux
+    const total_absence = parseFloat(result.total_absence) || 0;
+    const total_conges = parseFloat(result.total_conges) || 0;
+    const total_accident = parseFloat(result.total_accident) || 0;
+
+    const total_jours = 30; // ou calcul dynamique si besoin
+    const jours_effectivement_absents = total_absence + total_conges + total_accident;
+
+    const taux_absence = ((jours_effectivement_absents / total_jours) * 100).toFixed(2);
+    const taux_presence = (100 - taux_absence).toFixed(2);
+
+    const response = {
+      taux_presence: parseFloat(taux_presence),
+      taux_absence: parseFloat(taux_absence),
+      total_accident,
+      total_conges
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching attendance stats:', error);
+    res.status(500).json({ 
+      error: 'Erreur serveur lors de la récupération des statistiques',
+      details: error.message,
+      request_details: {
+        params: req.params,
+        query: req.query
+      }
+    });
+  }
+};
+
+
+
+// Récupérer les notifications
+exports.getNotifications = async (req, res) => {
+  try {
+    const { employee_id } = req.params; 
+
+    // Construction de la requête SQL
+    let query = `
+      SELECT
+        *
+      FROM hr_notifications s
+      
+    `;
+
+
+    if (employee_id) {
+      query += ` AND s.employee_id = $3`;
+    }
+
+    // Exécution de la requête
+    const { rows } = await pool.query(query);
+    const result = rows;
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching notification:', error);
+    res.status(500).json({ 
+      error: 'Erreur lors de la récupération des notifications',
+      details: error.message,
+      request_details: {
+        query: req.query
+      }
+    });
+  }
+};
+
+
+// Notifications lues
+exports.markNotificationAsRead = async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const { notification_ids } = req.body;
+    
+    // Vérifier si on a des IDs
+    if (!notification_ids || !Array.isArray(notification_ids) || notification_ids.length === 0) {
+      return res.status(400).json({ error: "Liste d'IDs de notification invalide" });
+    }
+
+    await client.query('BEGIN'); // Début de transaction
+
+    // Créer une liste de paramètres pour la requête ($1, $2, etc.)
+    const params = notification_ids.map((_, index) => `$${index + 1}`).join(',');
+    
+    // Première requête: vérifier l'existence des notifications
+    const checkQuery = {
+      text: `SELECT COUNT(*) FROM hr_notifications WHERE id IN (${params}) AND is_read = false`,
+      values: notification_ids
+    };
+    
+    const checkResult = await client.query(checkQuery);
+    const existingCount = parseInt(checkResult.rows[0].count);
+    
+    if (existingCount !== notification_ids.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ 
+        error: "Certaines notifications n'existent pas ou sont déjà lues",
+        details: {
+          requested: notification_ids.length,
+          found: existingCount
+        }
+      });
+    }
+
+    // Mettre à jour les notifications en une seule requête
+    const updateQuery = {
+      text: `UPDATE hr_notifications SET is_read = true WHERE id IN (${params})`,
+      values: notification_ids
+    };
+    
+    await client.query(updateQuery);
+    await client.query('COMMIT'); // Validation de la transaction
+    
+    res.status(200).json({ 
+      success: true,
+      updated_count: existingCount
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK'); // Annulation en cas d'erreur
+    console.error("Erreur de mise à jour de notification:", error);
+    res.status(500).json({ 
+      error: "Erreur serveur",
+      details: error.message 
+    });
+  } finally {
+    client.release(); // Libération du client
+  }
+};
+
+
 
 
 

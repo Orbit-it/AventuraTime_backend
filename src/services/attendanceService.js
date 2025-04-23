@@ -1395,7 +1395,7 @@ async function downloadAttendance(machine) {
 async function init_week_attendance(month = moment().startOf('month')) {
     const client = await pool.connect();
     try {
-        console.log("📅 Création des semaines sur la table week_attendance");
+        console.log("📅 Création des semaines sur la table week_attendance_summary");
 
         // Fonction pour générer les semaines
         const generatePayPeriodWeeks = (month) => {
@@ -1428,40 +1428,11 @@ async function init_week_attendance(month = moment().startOf('month')) {
                     weekEnd = endDate.clone();
                 }
 
-                // Création des jours de la semaine
-                const days = [];
-                const dayNames = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
-                
-                const startOffset = weekStart.day() - 1;
-                const adjustedStart = weekStart.clone().subtract(startOffset, 'days');
-
-                for (let i = 0; i < 7; i++) {
-                    const currentDay = adjustedStart.clone().add(i, 'days');
-                    if (currentDay.isBetween(weekStart, weekEnd, null, '[]')) {
-                        days.push({
-                            date: currentDay.clone(),
-                            label: dayNames[i],
-                            shortLabel: dayNames[i].substring(0, 3),
-                            key: currentDay.format('YYYY-MM-DD'),
-                            isActive: true
-                        });
-                    } else {
-                        days.push({
-                            date: null,
-                            label: dayNames[i],
-                            shortLabel: dayNames[i].substring(0, 3),
-                            key: `empty-${i}`,
-                            isActive: false
-                        });
-                    }
-                }
-
                 generatedWeeks.push({
                     start: weekStart.clone(),
                     end: weekEnd.clone(),
-                    label: `S${weekNum}`,
-                    days,
-                    key: `week-${weekNum}`
+                    weekNumber: weekNum,
+                    year: weekStart.year()
                 });
 
                 currentStart = weekEnd.clone().add(1, 'day');
@@ -1471,25 +1442,49 @@ async function init_week_attendance(month = moment().startOf('month')) {
             return generatedWeeks;
         };
 
-        // Requête d'insertion améliorée
+        // Requête d'insertion pour la nouvelle structure
         const insertQuery = `
-            INSERT INTO week_attendance (
-                employee_id, start_date, end_date, name,
-                total_night_hours, total_worked_hours, total_penalisable, 
-                total_sup, total_sunday_hours, total_missed_hours, 
-                total_jf, total_jc, total_htjf
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (employee_id, start_date) DO NOTHING
+            INSERT INTO week_attendance_summary (
+                employee_id, employee_payroll_id, employee_name,
+                week_number, year, start_date, end_date,
+                total_penalisable_hour, total_missed_hour, total_sup_hour, 
+                total_work_hour, total_worked_hour_on_holiday, total_jc_value, total_jcx_value,
+                monday_penalisable_hour, monday_missed_hour, monday_sup_hour, monday_work_hour,
+                monday_worked_hour_on_holiday, monday_jc_value, monday_jcx_value, monday_is_active,
+                tuesday_penalisable_hour, tuesday_missed_hour, tuesday_sup_hour, tuesday_work_hour,
+                tuesday_worked_hour_on_holiday, tuesday_jc_value, tuesday_jcx_value, tuesday_is_active,
+                wednesday_penalisable_hour, wednesday_missed_hour, wednesday_sup_hour, wednesday_work_hour,
+                wednesday_worked_hour_on_holiday, wednesday_jc_value, wednesday_jcx_value, wednesday_is_active,
+                thursday_penalisable_hour, thursday_missed_hour, thursday_sup_hour, thursday_work_hour,
+                thursday_worked_hour_on_holiday, thursday_jc_value, thursday_jcx_value, thursday_is_active,
+                friday_penalisable_hour, friday_missed_hour, friday_sup_hour, friday_work_hour,
+                friday_worked_hour_on_holiday, friday_jc_value, friday_jcx_value, friday_is_active,
+                saturday_penalisable_hour, saturday_missed_hour, saturday_sup_hour, saturday_work_hour,
+                saturday_worked_hour_on_holiday, saturday_jc_value, saturday_jcx_value, saturday_is_active,
+                sunday_penalisable_hour, sunday_missed_hour, sunday_sup_hour, sunday_work_hour,
+                sunday_worked_hour_on_holiday, sunday_jc_value, sunday_jcx_value, sunday_is_active
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19, $20, $21, $22,
+                $23, $24, $25, $26, $27, $28, $29, $30,
+                $31, $32, $33, $34, $35, $36, $37, $38,
+                $39, $40, $41, $42, $43, $44, $45, $46,
+                $47, $48, $49, $50, $51, $52, $53, $54,
+                $55, $56, $57, $58, $59, $60, $61, $62,
+                $63, $64, $65, $66, $67, $68, $69, $70
+            )
+            ON CONFLICT (employee_id, week_number, year) DO NOTHING
         `;
 
-        // Récupérer tous les employés
-        const { rows: employees } = await client.query('SELECT id, attendance_id FROM employees');
+        // Récupérer tous les employés avec plus d'informations
+        const { rows: employees } = await client.query('SELECT id, attendance_id, payroll_id, name FROM employees');
         if (employees.length === 0) {
             console.log('Aucun employé trouvé.');
             return;
         }
 
-        // Déterminer le mois de paie (vous pourriez le passer en paramètre)
+        // Déterminer le mois de paie
         const payMonth = moment().startOf('month');
         console.log(`🔄 Génération des semaines pour le mois de paie: ${payMonth.format('MMMM YYYY')}`);
 
@@ -1504,12 +1499,21 @@ async function init_week_attendance(month = moment().startOf('month')) {
                 await client.query('BEGIN');
 
                 for (const week of weeks) {
+                    const defaultValues = Array(63).fill(0);
+                    // Les valeurs booléennes pour les jours actifs
+                    for (let i = 22; i < 63; i += 8) {
+                        defaultValues[i] = true; // Tous les jours actifs par défaut
+                    }
+
                     await client.query(insertQuery, [
                         employee.attendance_id,
+                        employee.payroll_id,
+                        employee.name,
+                        week.weekNumber,
+                        week.year,
                         week.start.format('YYYY-MM-DD'),
                         week.end.format('YYYY-MM-DD'),
-                        week.label,
-                        0, 0, 0, 0, 0, 0, 0, 0, 0
+                        ...defaultValues
                     ]);
                 }
 
@@ -1521,7 +1525,7 @@ async function init_week_attendance(month = moment().startOf('month')) {
             }
         }
 
-        console.log("✅ Données créées avec succès dans week_attendance");
+        console.log("✅ Données créées avec succès dans week_attendance_summary");
     } catch (error) {
         console.error("❌ Erreur lors de la création des données:", error);
         throw error;
@@ -1529,6 +1533,466 @@ async function init_week_attendance(month = moment().startOf('month')) {
         client.release();
     }
 }
+
+// Fonction pour mettre à jour les week_attendance avec les données de attendance_summary (OK)
+// Fonction pour mettre à jour les week_attendance_summary avec les données de attendance_summary
+async function update_week_attendance() {
+    const client = await pool.connect();
+    try {
+        console.log("🔄 Mise à jour des totaux dans week_attendance_summary");
+
+        // 1. Récupérer tous les employés
+        const { rows: employees } = await client.query('SELECT id, attendance_id, payroll_id, name FROM employees');
+        if (employees.length === 0) {
+            console.log('Aucun employé trouvé.');
+            return;
+        }
+
+        // 2. Requête pour récupérer les totaux par jour et par semaine pour un employé
+        const getDailySummaryQuery = `
+            SELECT 
+                date,
+                hours_worked as work_hour,
+                missed_hour,
+                penalisable as penalisable_hour,
+                sup_hour,
+                worked_hours_on_holidays as worked_hour_on_holiday,
+                jc_value,
+                jcx_value
+            FROM attendance_summary
+            WHERE employee_id = $1 AND date BETWEEN $2 AND $3
+            ORDER BY date
+        `;
+
+        // 3. Requête de mise à jour complète
+        const updateQuery = `
+            UPDATE week_attendance_summary
+            SET 
+                total_penalisable_hour = $4,
+                total_missed_hour = $5,
+                total_sup_hour = $6,
+                total_work_hour = $7,
+                total_worked_hour_on_holiday = $8,
+                total_jc_value = $9,
+                total_jcx_value = $10,
+                
+                monday_penalisable_hour = $11,
+                monday_missed_hour = $12,
+                monday_sup_hour = $13,
+                monday_work_hour = $14,
+                monday_worked_hour_on_holiday = $15,
+                monday_jc_value = $16,
+                monday_jcx_value = $17,
+                monday_is_active = $18,
+                
+                tuesday_penalisable_hour = $19,
+                tuesday_missed_hour = $20,
+                tuesday_sup_hour = $21,
+                tuesday_work_hour = $22,
+                tuesday_worked_hour_on_holiday = $23,
+                tuesday_jc_value = $24,
+                tuesday_jcx_value = $25,
+                tuesday_is_active = $26,
+                
+                wednesday_penalisable_hour = $27,
+                wednesday_missed_hour = $28,
+                wednesday_sup_hour = $29,
+                wednesday_work_hour = $30,
+                wednesday_worked_hour_on_holiday = $31,
+                wednesday_jc_value = $32,
+                wednesday_jcx_value = $33,
+                wednesday_is_active = $34,
+                
+                thursday_penalisable_hour = $35,
+                thursday_missed_hour = $36,
+                thursday_sup_hour = $37,
+                thursday_work_hour = $38,
+                thursday_worked_hour_on_holiday = $39,
+                thursday_jc_value = $40,
+                thursday_jcx_value = $41,
+                thursday_is_active = $42,
+                
+                friday_penalisable_hour = $43,
+                friday_missed_hour = $44,
+                friday_sup_hour = $45,
+                friday_work_hour = $46,
+                friday_worked_hour_on_holiday = $47,
+                friday_jc_value = $48,
+                friday_jcx_value = $49,
+                friday_is_active = $50,
+                
+                saturday_penalisable_hour = $51,
+                saturday_missed_hour = $52,
+                saturday_sup_hour = $53,
+                saturday_work_hour = $54,
+                saturday_worked_hour_on_holiday = $55,
+                saturday_jc_value = $56,
+                saturday_jcx_value = $57,
+                saturday_is_active = $58,
+                
+                sunday_penalisable_hour = $59,
+                sunday_missed_hour = $60,
+                sunday_sup_hour = $61,
+                sunday_work_hour = $62,
+                sunday_worked_hour_on_holiday = $63,
+                sunday_jc_value = $64,
+                sunday_jcx_value = $65,
+                sunday_is_active = $66,
+                
+                updated_at = CURRENT_TIMESTAMP
+            WHERE employee_id = $1 AND week_number = $2 AND year = $3
+        `;
+
+        // 4. Pour chaque employé, récupérer ses semaines existantes
+        for (const employee of employees) {
+            try {
+                await client.query('BEGIN');
+
+                // Récupérer toutes les semaines existantes pour cet employé
+                const { rows: weeks } = await client.query(
+                    'SELECT id, week_number, year, start_date, end_date FROM week_attendance_summary WHERE employee_id = $1 ORDER BY start_date',
+                    [employee.attendance_id]
+                );
+
+                for (const week of weeks) {
+                    // Récupérer les données quotidiennes
+                    const { rows: dailyData } = await client.query(getDailySummaryQuery, [
+                        employee.attendance_id,
+                        week.start_date,
+                        week.end_date
+                    ]);
+
+                    // Initialiser les totaux
+                    const totals = {
+                        penalisable: 0,
+                        missed: 0,
+                        sup: 0,
+                        work: 0,
+                        holiday: 0,
+                        jc: 0,
+                        jcx: 0
+                    };
+
+                    // Initialiser les données par jour
+                    const daysData = {
+                        monday: initDayData(),
+                        tuesday: initDayData(),
+                        wednesday: initDayData(),
+                        thursday: initDayData(),
+                        friday: initDayData(),
+                        saturday: initDayData(),
+                        sunday: initDayData()
+                    };
+
+                    // Traiter chaque jour de données
+                    for (const day of dailyData) {
+                        const date = moment(day.date);
+                        const dayName = getDayName(date.day());
+                        
+                        if (daysData[dayName]) {
+                            daysData[dayName] = {
+                                penalisable: parseFloat(day.penalisable_hour) || 0,
+                                missed: parseFloat(day.missed_hour) || 0,
+                                sup: parseFloat(day.sup_hour) || 0,
+                                work: parseFloat(day.work_hour) || 0,
+                                holiday: parseFloat(day.worked_hour_on_holiday) || 0,
+                                jc: parseInt(day.jc_value) || 0,
+                                jcx: parseInt(day.jcx_value) || 0,
+                                isActive: true
+                            };
+
+                            // Mettre à jour les totaux
+                            totals.penalisable += daysData[dayName].penalisable;
+                            totals.missed += daysData[dayName].missed;
+                            totals.sup += daysData[dayName].sup;
+                            totals.work += daysData[dayName].work;
+                            totals.holiday += daysData[dayName].holiday;
+                            totals.jc += daysData[dayName].jc;
+                            totals.jcx += daysData[dayName].jcx;
+                        }
+                    }
+
+                    // Préparer les paramètres pour la requête
+                    const params = [
+                        employee.attendance_id,
+                        week.week_number,
+                        week.year,
+                        totals.penalisable,
+                        totals.missed,
+                        totals.sup,
+                        totals.work,
+                        totals.holiday,
+                        totals.jc,
+                        totals.jcx,
+                        // Lundi
+                        daysData.monday.penalisable,
+                        daysData.monday.missed,
+                        daysData.monday.sup,
+                        daysData.monday.work,
+                        daysData.monday.holiday,
+                        daysData.monday.jc,
+                        daysData.monday.jcx,
+                        daysData.monday.isActive,
+                        // Mardi
+                        daysData.tuesday.penalisable,
+                        daysData.tuesday.missed,
+                        daysData.tuesday.sup,
+                        daysData.tuesday.work,
+                        daysData.tuesday.holiday,
+                        daysData.tuesday.jc,
+                        daysData.tuesday.jcx,
+                        daysData.tuesday.isActive,
+                        // Mercredi
+                        daysData.wednesday.penalisable,
+                        daysData.wednesday.missed,
+                        daysData.wednesday.sup,
+                        daysData.wednesday.work,
+                        daysData.wednesday.holiday,
+                        daysData.wednesday.jc,
+                        daysData.wednesday.jcx,
+                        daysData.wednesday.isActive,
+                        // Jeudi
+                        daysData.thursday.penalisable,
+                        daysData.thursday.missed,
+                        daysData.thursday.sup,
+                        daysData.thursday.work,
+                        daysData.thursday.holiday,
+                        daysData.thursday.jc,
+                        daysData.thursday.jcx,
+                        daysData.thursday.isActive,
+                        // Vendredi
+                        daysData.friday.penalisable,
+                        daysData.friday.missed,
+                        daysData.friday.sup,
+                        daysData.friday.work,
+                        daysData.friday.holiday,
+                        daysData.friday.jc,
+                        daysData.friday.jcx,
+                        daysData.friday.isActive,
+                        // Samedi
+                        daysData.saturday.penalisable,
+                        daysData.saturday.missed,
+                        daysData.saturday.sup,
+                        daysData.saturday.work,
+                        daysData.saturday.holiday,
+                        daysData.saturday.jc,
+                        daysData.saturday.jcx,
+                        daysData.saturday.isActive,
+                        // Dimanche
+                        daysData.sunday.penalisable,
+                        daysData.sunday.missed,
+                        daysData.sunday.sup,
+                        daysData.sunday.work,
+                        daysData.sunday.holiday,
+                        daysData.sunday.jc,
+                        daysData.sunday.jcx,
+                        daysData.sunday.isActive
+                    ];
+
+                    await client.query(updateQuery, params);
+                }
+
+                await client.query('COMMIT');
+                console.log(`✓ ${weeks.length} semaines mises à jour pour l'employé ${employee.attendance_id}`);
+            } catch (error) {
+                await client.query('ROLLBACK');
+                console.error(`Erreur lors de la mise à jour pour l'employé ${employee.attendance_id}:`, error);
+            }
+        }
+
+        console.log(`✅ Totaux mis à jour pour ${employees.length} employés`);
+    } catch (error) {
+        console.error("❌ Erreur lors de la mise à jour des totaux:", error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Fonctions utilitaires
+function initDayData() {
+    return {
+        penalisable: 0,
+        missed: 0,
+        sup: 0,
+        work: 0,
+        holiday: 0,
+        jc: 0,
+        jcx: 0,
+        isActive: false
+    };
+}
+
+function getDayName(dayIndex) {
+    // moment.js: 0=dimanche, 1=lundi, etc.
+    const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    return days[dayIndex];
+}
+
+
+// Fonction pour créer des données sur la table week_attendance à partir des données de attendance_summary
+async function init_month_attendance(month = moment().startOf('month')) {
+    const client = await pool.connect();
+    try {
+        console.log("📅 Création des mois de paie sur la table monthly_attendance");
+
+        const currentMonthStart = moment().startOf('month').utc();
+        const startDate = moment(currentMonthStart).subtract(1, 'month').date(26);
+        const endDate = moment(currentMonthStart).date(25);
+
+       
+        // Requête d'insertion pour la nouvelle structure
+        const insertQuery = `
+            INSERT INTO monthly_attendance (
+                employee_id, payroll_id, employee_name, month_start, month_end
+            ) VALUES (
+                $1, $2, $3, $4::DATE, $5
+            )
+            ON CONFLICT (employee_id, month_start) DO NOTHING
+        `;
+
+        // Récupérer tous les employés avec plus d'informations
+        const { rows: employees } = await client.query('SELECT id, attendance_id, payroll_id, name FROM employees');
+        if (employees.length === 0) {
+            console.log('Aucun employé trouvé.');
+            return;
+        }
+
+
+        // Insérer les données pour chaque employé
+        for (const employee of employees) {
+            try {
+                // Utilisation d'une transaction par employé pour plus de sécurité
+                await client.query('BEGIN');
+
+                    await client.query(insertQuery, [
+                        
+                        employee.attendance_id,
+                        employee.payroll_id,
+                        employee.name,
+                        startDate,
+                        endDate
+                        
+                    ]);
+            
+
+                await client.query('COMMIT');
+                console.log(`✓ Mois de paie crée pour l'employé ${employee.attendance_id}`);
+            } catch (error) {
+                await client.query('ROLLBACK');
+                console.error(`Erreur pour l'employé ${employee.attendance_id}:`, error);
+            }
+        }
+
+        console.log("✅ Données créées avec succès dans month_attendance");
+    } catch (error) {
+        console.error("❌ Erreur lors de la création des données:", error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Fonction pour remplir monthly_attendance avec les données de week_attendance (A TESTER)
+async function update_monthly_attendance() {
+    const client = await pool.connect();
+    try {
+        console.log("🔄 Mise à jour des totaux mensuels");
+
+        // Requête d'insertion/mise à jour
+        const query = `
+            INSERT INTO monthly_attendance (
+                employee_id, payroll_id, month_start, month_end,
+                total_night_hours, total_worked_hours, total_penalisable,
+                total_sup, total_sunday_hours, total_missed_hours,
+                total_jf, total_jc, total_jcx, total_htjf
+            )
+            SELECT 
+                e.attendance_id,
+                e.payroll_id,
+                DATE_TRUNC('month', wa.start_date - INTERVAL '5 days')::date AS month_start,
+                (DATE_TRUNC('month', wa.start_date - INTERVAL '5 days') + INTERVAL '1 month' - INTERVAL '1 day')::date AS month_end,
+                SUM(wa.total_night_hours) AS total_night_hours,
+                SUM(wa.total_worked_hours) AS total_worked_hours,
+                SUM(wa.total_penalisable) AS total_penalisable,
+                SUM(wa.total_sup) AS total_sup,
+                SUM(wa.total_sunday_hours) AS total_sunday_hours,
+                SUM(wa.total_missed_hours) AS total_missed_hours,
+                SUM(wa.total_jf) AS total_jf,
+                SUM(wa.total_jc) AS total_jc,
+                SUM(wa.total_jcx) AS total_jcx,
+                SUM(wa.total_htjf) AS total_htjf
+            FROM week_attendance wa
+            JOIN employees e ON wa.employee_id = e.attendance_id
+            GROUP BY e.attendance_id, e.payroll_id, DATE_TRUNC('month', wa.start_date - INTERVAL '5 days')
+            ON CONFLICT (employee_id, month_start) 
+            DO UPDATE SET
+                payroll_id = EXCLUDED.payroll_id,
+                month_end = EXCLUDED.month_end,
+                total_night_hours = EXCLUDED.total_night_hours,
+                total_worked_hours = EXCLUDED.total_worked_hours,
+                total_penalisable = EXCLUDED.total_penalisable,
+                total_sup = EXCLUDED.total_sup,
+                total_sunday_hours = EXCLUDED.total_sunday_hours,
+                total_missed_hours = EXCLUDED.total_missed_hours,
+                total_jf = EXCLUDED.total_jf,
+                total_jc = EXCLUDED.total_jc,
+                total_jcx = EXCLUDED.total_jcx,
+                total_htjf = EXCLUDED.total_htjf,
+                updated_at = NOW()
+        `;
+
+        await client.query(query);
+        console.log("✅ Totaux mensuels mis à jour avec succès");
+    } catch (error) {
+        console.error("❌ Erreur lors de la mise à jour des totaux mensuels:", error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+
+
+const getWeeklyAttendanceByDate = async (req, res) => {
+    const { date } = req.query;
+    
+    try {
+        const query = `
+            SELECT 
+                wa.*, 
+                e.firstname, 
+                e.lastname, 
+                e.matricule,
+                a.hours_worked,
+                a.missed_hours,
+                a.sup_hour,
+                a.night_hours,
+                a.sunday_hour,
+                a.worked_hours_on_holidays
+            FROM week_attendance wa
+            JOIN employees e ON wa.employee_id = e.attendance_id
+            LEFT JOIN attendance_summary a ON a.employee_id = wa.employee_id 
+                AND a.date = $1
+            WHERE wa.start_date <= $1 AND wa.end_date >= $1
+            ORDER BY e.lastname, e.firstname
+        `;
+        
+        const { rows } = await pool.query(query, [date]);
+        
+        res.json({
+            success: true,
+            data: rows
+        });
+    } catch (error) {
+        console.error('Error fetching daily attendance:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Erreur lors de la récupération des données journalières'
+        });
+    }
+};
+
 
 module.exports = { 
     downloadAttendance, 
@@ -1539,4 +2003,7 @@ module.exports = {
     processAllNightShifts,
     processMonthlyAttendance,
     init_week_attendance,
+    update_week_attendance,
+    update_monthly_attendance,
+    init_month_attendance,
 };

@@ -1,6 +1,7 @@
 const express = require("express");
-const { getAttendanceStats, addAttendance,
-   updateAttendance, getAttendanceWithMultipleShifts, addManualAttendance,
+const Notification = require("../models/Notification");
+const { getAttendanceStats, addAttendance, getWeekAttendanceSummary, getDashboardDatas, getNotifications,
+   updateAttendance, getAttendanceWithMultipleShifts, addManualAttendance, markNotificationAsRead,
     getAttendanceSummary, importAttendances } =  require("../controllers/attendanceController");
 const multer = require('multer');
 
@@ -29,6 +30,12 @@ router.get("/summary", getAttendanceSummary); // Recupérer les pointages calcul
 router.post('/import-excel', upload.single('file'), importAttendances);
 router.get('/attendance-stats/:start_date/:end_date/:employee_id?', getAttendanceStats);
 router.post('/manual-attendance', addManualAttendance); // Ajouter un pointage manuel
+router.get('/weekly-attendance', getWeekAttendanceSummary); // Récupérer les pointages hebdomadaires
+router.get('/dashboard', getDashboardDatas);
+router.get('/notif', getNotifications);
+router.post('/notifications/mark-as-read', markNotificationAsRead);
+
+
 
 
 module.exports = router;
