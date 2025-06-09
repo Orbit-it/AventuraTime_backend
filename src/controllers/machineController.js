@@ -57,6 +57,7 @@ exports.downloadAttendance = async (req, res) => {
     if (!machine) {
       return res.status(404).json({ error: "Machine not found" });
     }
+
     const data = await machineService.downloadAttendance(machine);
     res.json(data);
 

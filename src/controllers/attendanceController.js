@@ -6,6 +6,12 @@ const fs = require('fs');
 const path = require('path');
 const { response } = require("express");
 const { ok } = require("assert");
+const { processManualAttendance, updateAttendanceSummaryFromTimes } = require('../services/attendanceService');
+
+const moment = require('moment');
+
+moment.locale('fr');
+
 
 exports.importAttendances = async (req, res) => {
   if (!req.file) {
@@ -15,32 +21,32 @@ exports.importAttendances = async (req, res) => {
   const filePath = req.file.path;
 
   try {
-    // Lire le fichier Excel
     const workbook = xlsx.readFile(filePath);
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
     const attendanceData = xlsx.utils.sheet_to_json(worksheet);
 
-    // Date de début pour filtrer (1er Mars 2025)
-    const startDate = new Date('2025-03-01T00:00:00Z');
     let importedCount = 0;
     let skippedCount = 0;
     const errors = [];
 
-    // Traitement des données
     for (const [index, record] of attendanceData.entries()) {
       try {
-        // Extraire la date (format: "LUN24/03/2025")
-        const dayDateMatch = record.Date?.match(/([A-Z]{3})(\d{2}\/\d{2}\/\d{4})/);
-        if (!dayDateMatch) {
+        const rawDate = record.Date;
+        console.log("📅 Date brute depuis CSV:", rawDate);
+
+        const excelSerialNumber = parseFloat(rawDate);
+        if (isNaN(excelSerialNumber)) {
           errors.push(`Ligne ${index + 2}: Format de date invalide`);
           skippedCount++;
           continue;
         }
 
-        const dateStr = dayDateMatch[2]; // "24/03/2025"
-        const [day, month, year] = dateStr.split('/');
-        const baseDate = new Date(`${year}-${month}-${day}`);
+        const jsDate = new Date(1899, 11, 30 + excelSerialNumber);
+        const d = String(jsDate.getDate()).padStart(2, '0');
+        const m = String(jsDate.getMonth() + 1).padStart(2, '0');
+        const y = jsDate.getFullYear();
+        const baseDate = new Date(`${y}-${m}-${d}`);
 
         if (isNaN(baseDate.getTime())) {
           errors.push(`Ligne ${index + 2}: Date invalide`);
@@ -48,18 +54,18 @@ exports.importAttendances = async (req, res) => {
           continue;
         }
 
-        const matricule = record.Matricule;
-        if (!matricule) {
+        const matricule = ('Matricule' in record) ? record.Matricule : record.sJobNo;
+
+        if (!matricule || matricule == "1") {
           errors.push(`Ligne ${index + 2}: Matricule manquant`);
           skippedCount++;
           continue;
         }
 
-        // Vérifier si l'employé existe
         const employeeCheck = await pool.query(
           'SELECT id FROM employees WHERE attendance_id = $1',
           [matricule]
-        ); 
+        );
 
         if (employeeCheck.rowCount === 0) {
           errors.push(`Ligne ${index + 2}: Employé avec matricule ${matricule} non trouvé`);
@@ -67,42 +73,64 @@ exports.importAttendances = async (req, res) => {
           continue;
         }
 
-        // Traiter chaque pointage
-        const punches = [
-          { time: record.Pointage_1 },
-          { time: record.Pointage_2 },
-          { time: record.Pointage_3 },
-          { time: record.Pointage_4 }
-        ];
+        const employeeId = employeeCheck.rows[0].id;
+
+        const punches = [];
+
+        ['Time','Pointage_1', 'Pointage_2', 'Pointage_3', 'Pointage_4'].forEach(key => {
+          if (key in record) {
+            punches.push({ time: record[key] });
+          }
+        });
+
 
         for (const punch of punches) {
-          if (!punch.time || punch.time.trim() === '') continue;
+          if (punch.time == null || punch.time === '') continue;
 
-          // Créer l'objet Date complet
-          const [hours, minutes, seconds] = punch.time.split(':');
+          let timeString = '';
+
+          // Cas 1: heure est un nombre Excel
+          if (typeof punch.time === 'number') {
+            const totalSeconds = Math.round(punch.time * 24 * 60 * 60);
+            const hours = Math.floor(totalSeconds / 3600).toString().padStart(2, '0');
+            const minutes = Math.floor((totalSeconds % 3600) / 60).toString().padStart(2, '0');
+            const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+            timeString = `${hours}:${minutes}:${seconds}`;
+          }
+          // Cas 2: chaîne classique
+          else if (typeof punch.time === 'string') {
+            timeString = punch.time.trim();
+          } else {
+            errors.push(`Ligne ${index + 2}: Format de pointage inconnu (${punch.time})`);
+            skippedCount++;
+            continue;
+          }
+
+          const [hours, minutes, seconds] = timeString.split(':');
+
+          if (isNaN(hours) || isNaN(minutes) || isNaN(seconds)) {
+            errors.push(`Ligne ${index + 2}: Heure de pointage invalide (${timeString})`);
+            skippedCount++;
+            continue;
+          }
+
           const punchTime = new Date(baseDate);
           punchTime.setHours(parseInt(hours), parseInt(minutes), parseInt(seconds));
 
-          /* Vérifier la date au delà du premier Mars 2025
-          if (punchTime < startDate) {
-            skippedCount++;
-            continue;
-          }  */
-
-           // Vérifier les doublons
           const duplicateCheck = await pool.query(
             `SELECT id FROM attendance_records 
              WHERE employee_id = $1 
-             AND punch_time BETWEEN $2 - INTERVAL '1 minute' AND $2 + INTERVAL '1 minute'`,
+             AND punch_time BETWEEN $2::timestamp - INTERVAL '1 minute' AND $2::timestamp + INTERVAL '1 minute'
+`,
             [matricule, punchTime]
           );
 
           if (duplicateCheck.rowCount > 0) {
+            console.log(`🔁 Doublon ignoré (ligne ${index + 2}, heure: ${timeString})`);
             skippedCount++;
             continue;
-          }  
+          }
 
-          // Insérer dans la base
           await pool.query(
             `INSERT INTO attendance_records 
              (employee_id, shift_id, punch_time, punch_source)
@@ -113,13 +141,14 @@ exports.importAttendances = async (req, res) => {
 
           importedCount++;
         }
+
       } catch (error) {
+        console.error(`❌ Erreur à la ligne ${index + 2} :`, error.message);
         errors.push(`Ligne ${index + 2}: Erreur de traitement - ${error.message}`);
         skippedCount++;
       }
     }
 
-    // Supprimer le fichier temporaire
     fs.unlinkSync(filePath);
 
     return res.json({
@@ -131,34 +160,82 @@ exports.importAttendances = async (req, res) => {
     });
 
   } catch (error) {
-    // Nettoyer le fichier en cas d'erreur
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
-    
+
     console.error('Erreur lors de l\'import Excel:', error);
-    return res.status(500).json({ 
-      success: false, 
+    return res.status(500).json({
+      success: false,
       message: 'Erreur lors du traitement du fichier Excel',
-      error: error.message 
+      error: error.message
     });
   }
 };
 
-// Ajouter un pointage manuelle
+
+// coorection manuelle à partir de la page Pointage
 exports.addAttendance = async (req, res) => {
   try {
-    const { employee_id, punch_time } = req.body;
-    const manualAttendance = await Attendance.create({ 
-        employee_id,
-        punch_time, 
-        punch_type :'MANUAL'
-     });
-    res.status(201).json(manualAttendance);
+    const { employee, date, getin, getout, autorizgetOut, autorizgetIn } = req.body;
+
+    await updateAttendanceSummaryFromTimes(employee, date, getin, getout, autorizgetOut, autorizgetIn);
+      res.status(200).json({
+      ok: true,
+      message: "Pointage corrigé avec succès !",
+      corrected: true
+    });
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    res.status(400).json({ error: error.message,
+      message: `Erreur de correction de pointage: ${error}`,
+      ok: false,
+      corrected: false });
   }
 };
+
+
+
+
+
+// Supprimer un pointage
+exports.deletePointage = async (req, res) => {
+  try {
+    const { id } = req.params; // On récupère l'ID du pointage à supprimer depuis les paramètres de la route
+
+    // Vérification que l'ID existe
+    if (!id) {
+      return res.status(400).json({ error: "L'ID du pointage est requis" });
+    }
+
+    // Recherche et suppression du pointage
+    const deletedAttendance = await Attendance.destroy({
+      where: { 
+        id: id,
+        punch_source: 'MANUAL' // Optionnel: on ne supprime que les pointages manuels
+      }
+    });
+
+    // Vérification si un pointage a bien été supprimé
+    if (deletedAttendance === 0) {
+      return res.status(404).json({ error: "Pointage non trouvé ou déjà supprimé" });
+    }
+
+    res.status(200).json({ 
+      message: "Pointage supprimé avec succès",
+      deletedId: id
+    });
+
+  } catch (error) {
+    console.error("Erreur lors de la suppression du pointage:", error);
+    res.status(500).json({ 
+      error: "Erreur lors de la suppression du pointage",
+      details: error.message 
+    });
+  }
+};
+
+
+
 
 // Récupérer tous les pointages
 exports.getAttendance = async (req, res) => {
@@ -376,10 +453,7 @@ exports.getWeeklyAttendance = async (req, res) => {
           daily_data: row.daily_data || [] // Assure un tableau vide si pas de données quotidiennes
       }));
       
-      res.json({
-          success: true,
-          data: result
-      });
+      res.json({ result });
   } catch (error) {
       console.error('Error fetching weekly attendance:', error);
       res.status(500).json({
@@ -400,6 +474,136 @@ exports.updateAttendance = async (req, res) => {
     res.json(attendance);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+};
+
+/*
+ * Récupère les données de présence hebdomadaires pour l'API
+ * @param {Object} params - Paramètres de requête
+ * @param {number} [params.employee_id] - Filtre par ID employé (optionnel)
+ * @param {string} [params.month] - Mois au format 'YYYY-MM' (optionnel, ex: '2025-06')
+ * @param {number} [params.limit] - Limite de résultats (optionnel)
+ * @param {number} [params.offset] - Offset pour la pagination (optionnel)
+ * @returns {Promise<Array>} - Tableau d'objets formatés pour l'API
+ */
+exports.getWeekAttendanceData = async (req, res) => {
+  const { start_date, end_date, employee_id, month, limit, offset } = req.query;
+
+  try {
+    // Construction de la requête de base simplifiée
+    let query = `
+      SELECT 
+        id,
+        name,
+        employee_id,
+        start_date,
+        end_date,
+        total_night_hours,
+        total_worked_hours,
+        total_penalisable,
+        total_sup,
+        total_missed_hours,
+        total_sunday_hours,
+        total_jf,
+        total_jc,
+        total_htjf,
+        total_jcx
+      FROM week_attendance
+      WHERE 1=1
+    `;
+
+    const params = [];
+    let paramCount = 1;
+
+    // Filtres
+    if (start_date && end_date) {
+      query += ` AND start_date >= $${paramCount++} AND end_date <= $${paramCount++}`;
+      params.push(start_date, end_date);
+    }
+
+    if (employee_id) {
+      query += ` AND employee_id = $${paramCount++}`;
+      params.push(employee_id);
+    }
+
+    if (month) {
+      const monthStart = moment(month, 'YYYY-MM').startOf('month').format('YYYY-MM-DD');
+      const monthEnd = moment(month, 'YYYY-MM').endOf('month').format('YYYY-MM-DD');
+      query += ` AND start_date >= $${paramCount++} AND end_date <= $${paramCount++}`;
+      params.push(monthStart, monthEnd);
+    }
+
+    // Tri
+    query += ` ORDER BY start_date DESC`;
+
+    // Pagination
+    if (limit) {
+      query += ` LIMIT $${paramCount++}`;
+      params.push(limit);
+    }
+
+    if (offset) {
+      query += ` OFFSET $${paramCount++}`;
+      params.push(offset);
+    }
+
+    // Exécution de la requête
+    const { rows } = await pool.query(query, params);
+
+    // Formatage des résultats simplifié
+    const formattedData = rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      employee_id: row.employee_id,
+      start_date: moment(row.start_date).format('DD-MM-YYYY'), // Format JJ-MM-AAAA
+      end_date: moment(row.end_date).format('DD-MM-YYYY'),     // Format JJ-MM-AAAA
+      total_night_hours: row.total_night_hours,
+      total_worked_hours: row.total_worked_hours,
+      total_penalisable: row.total_penalisable,
+      total_sup: row.total_sup,
+      total_missed_hours: row.total_missed_hours,
+      total_sunday_hours: row.total_sunday_hours,
+      total_jf: row.total_jf,
+      total_jc: row.total_jc,
+      total_htjf: row.total_htjf,
+      total_jcx: row.total_jcx
+    }));
+
+    // Calcul du total pour la pagination
+    let totalCount = rows.length;
+    if (limit || offset) {
+      const countQuery = `
+        SELECT COUNT(*) 
+        FROM week_attendance
+        WHERE 1=1
+        ${start_date && end_date ? `AND start_date >= $1 AND end_date <= $2` : ''}
+        ${employee_id ? `AND employee_id = $${start_date && end_date ? 3 : 1}` : ''}
+        ${month ? `AND start_date >= $${start_date && end_date ? (employee_id ? 4 : 3) : 1} 
+                  AND end_date <= $${start_date && end_date ? (employee_id ? 5 : 4) : 2}` : ''}
+      `;
+
+      const countParams = [];
+      if (start_date && end_date) countParams.push(start_date, end_date);
+      if (employee_id) countParams.push(employee_id);
+      if (month) {
+        const monthStart = moment(month, 'YYYY-MM').startOf('month').format('YYYY-MM-DD');
+        const monthEnd = moment(month, 'YYYY-MM').endOf('month').format('YYYY-MM-DD');
+        countParams.push(monthStart, monthEnd);
+      }
+
+      const countResult = await pool.query(countQuery, countParams);
+      totalCount = parseInt(countResult.rows[0].count, 10);
+    }
+
+    res.json(formattedData);
+
+  } catch (error) {
+    console.error('Error in getWeekAttendanceData:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors de la récupération des données',
+      error: error.message
+    });
   }
 };
 
@@ -471,6 +675,8 @@ exports.getAttendanceSummary = async (req, res) => {
               sunday_hour, 
               is_accident,
               is_maladie,
+              is_today,
+              is_anomalie,
               is_congex,
               night_getin,
               night_getout,
@@ -572,40 +778,339 @@ exports.addManualAttendance = async (req, res) => {
   try {
     const { employee_id, punch_time, punch_type } = req.body;
 
-    // Vérifier si le pointage existe déjà
-    const existingAttendance = await Attendance.findOne({
-      where: {
-        employee_id,
-        punch_time
-      }
-    });
+    // Extraire la date (sans l'heure) du punch_time
+    const punchDate = new Date(punch_time);
+    punchDate.setHours(0, 0, 0, 0); // Réinitialiser l'heure à minuit
 
-    if (existingAttendance) {
-      return res.status(409).json({ error: "Ce pointage existe déjà:même Date et même Heure." });
+    // 1. Vérifier les pointages proches dans le temps (±2 minutes)
+    const checkQuery = `
+      SELECT id, punch_type 
+      FROM attendance_records 
+      WHERE employee_id = $1 
+      AND ABS(EXTRACT(EPOCH FROM (punch_time - $2::timestamp))) <= 120
+      ORDER BY punch_time DESC
+      LIMIT 1;
+    `;
+    
+    const nearbyRecords = await pool.query(checkQuery, [employee_id, punch_time]);
+
+    // 2. Logique de correction/détection d'anomalies
+    if (nearbyRecords.rows.length > 0) {
+      const existingRecord = nearbyRecords.rows[0];
+      
+      // Cas 1: Même type de pointage (IN/OUT) → probable doublon
+      if (existingRecord.punch_type === punch_type) {
+        // Option 2: Mettre à jour le pointage existant
+        const updateQuery = `
+          UPDATE attendance_records 
+          SET punch_time = $1, punch_source = 'MANUAL_CORRECTED'
+          WHERE id = $2
+          RETURNING *;
+        `;
+        const updated = await pool.query(updateQuery, [punch_time, existingRecord.id]);
+        
+        // Appliquer verifyAndFixPunchSequence pour ce jour spécifique
+        await verifyAndFixPunchSequenceForDay(employee_id, punchDate);
+        
+        return res.status(200).json({
+          ok: true,
+          message: "Pointage existant mis à jour",
+          corrected: true,
+          previous_time: existingRecord.punch_time,
+          record: updated.rows[0]
+        });
+      }
+      
+      // Cas 2: Pointage IN alors que le dernier était IN (oubli de OUT)
+      if (punch_type === 'IN' && existingRecord.punch_type === 'IN') {
+        // Ajouter un OUT automatique 1 minute avant le nouveau IN
+        const autoOutTime = new Date(punch_time);
+        autoOutTime.setMinutes(autoOutTime.getMinutes() - 1);
+        
+        await pool.query(
+          `INSERT INTO attendance_records 
+          (employee_id, punch_time, punch_type, punch_source) 
+          VALUES ($1, $2, 'OUT', 'AUTO_CORRECTED')`,
+          [employee_id, autoOutTime]
+        );
+      }
     }
 
-    // Insérer dans la base de données
-    const query = `
-    INSERT INTO attendance_records (employee_id, punch_time, punch_type, punch_source)
-    VALUES ($1, $2, $3, 'MANUAL');
+    // 3. Insérer le nouveau pointage si aucun conflit ou après corrections
+    const insertQuery = `
+      INSERT INTO attendance_records 
+      (employee_id, punch_time, punch_type, punch_source)
+      VALUES ($1, $2, $3, 'MANUAL')
+      RETURNING *;
     `;
+    
+    const newRecord = await pool.query(insertQuery, [employee_id, punch_time, punch_type]);
 
-    await pool.query(query, [employee_id, punch_time, punch_type]);
+    // 4. Appliquer verifyAndFixPunchSequence pour ce jour spécifique
+    await verifyAndFixPunchSequenceForDay(employee_id, punchDate);
+    await processManualAttendance(punchDate, employee_id);
 
-
-
-    const response = {
+    res.status(201).json({
       ok: true,
-      message: "Pointage ajouté avec succès.",
-    };
+      message: "Pointage ajouté avec succès",
+      record: newRecord.rows[0],
+      corrected: false
+    });
 
-    console.log("Nouvelle entrée de pointage:");
-
-    res.status(201).json(response);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("Erreur addManualAttendance:", error);
+    res.status(500).json({ 
+      ok: false,
+      error: "Erreur serveur",
+      details: error.message 
+    });
   }
 };
+
+// Nouvelle fonction pour appliquer verifyAndFixPunchSequence à un jour spécifique
+async function verifyAndFixPunchSequenceForDay(employee_id, date) {
+  console.log(`[Correction] Application de verifyAndFixPunchSequence pour l'employé ${employee_id} le ${date.toISOString().split('T')[0]}`);
+  
+  try {
+    // 1. Récupération des données pour ce jour spécifique
+    const { rows: punches } = await pool.query(`
+      SELECT ar.id, ar.employee_id, e.name as employee_name, 
+             ar.punch_time, ar.punch_type, ar.punch_source
+      FROM attendance_records ar
+      LEFT JOIN employees e ON ar.employee_id = e.attendance_id
+      WHERE ar.employee_id = $1 
+      AND DATE(ar.punch_time) = DATE($2)
+      AND ar.punch_type IS NOT NULL
+      ORDER BY ar.punch_time`,
+      [employee_id, date]
+    );
+
+    if (punches.length === 0) {
+      console.log('→ Aucun pointage à vérifier pour ce jour');
+      return;
+    }
+
+    // 2. Structuration des données pour le traitement
+    const dayKey = date.toISOString().split('T')[0];
+    const employeeData = {
+      name: punches[0]?.employee_name || 'Nom inconnu',
+      days: {
+        [dayKey]: punches
+      }
+    };
+
+    // 3. Variables pour stocker les corrections
+    const allCorrections = [];
+    const allNotifications = [];
+    const allReviews = [];
+
+    // 4. Traitement spécifique pour ce jour
+    const dayPunches = employeeData.days[dayKey];
+    console.log(`→ ${dayPunches.length} pointages à vérifier pour (${employee_id}) le ${dayKey}`);
+
+    // Filtrage avec marge (6h-22h)
+    const dayShiftPunches = dayPunches.filter(punch => {
+      const punchTime = new Date(punch.punch_time);
+      const totalMinutes = punchTime.getHours() * 60 + punchTime.getMinutes();
+      return totalMinutes >= 360 && totalMinutes <= 1320; // 6h=360min, 22h=1320min
+    });
+
+    if (dayShiftPunches.length === 0) {
+      console.log('→ Aucun pointage dans la plage 6h-22h');
+      return;
+    }
+
+    console.log(`→ ${dayShiftPunches.length} pointages à vérifier (6h-22h)`);
+
+    // Vérification pointages impairs
+    const today = new Date().toISOString().split('T')[0];
+    if (dayShiftPunches.length % 2 !== 0 && dayKey !== today) {
+      allNotifications.push({
+        employeeId: employee_id,
+        type: 'POINTAGE_IMPAIR',
+        message: `Nombre impair de pointages (${dayShiftPunches.length}) pour (${employee_id}) le ${dayKey}`
+      });
+      console.log(`❌ Nombre impair de pointages (${dayShiftPunches.length})`);
+    }
+
+    let expectedNextType = null;
+    let dayIssues = 0;
+
+    for (let i = 0; i < dayShiftPunches.length; i++) {
+      const punch = dayShiftPunches[i];
+      const punchTime = new Date(punch.punch_time);
+      const timeStr = punchTime.toLocaleTimeString('fr-FR', {hour: '2-digit', minute:'2-digit'});
+      
+      try {
+        console.log(`  #${i+1} ${timeStr} [${punch.punch_type}]`);
+
+        // Détection OUT matinal suspect (avant 12h sans IN préalable)
+        if (punch.punch_type === 'OUT' && punchTime.getHours() < 12) {
+          const isFirstPunch = i === 0;
+          const hasNoPreviousIN = i > 0 && dayShiftPunches[i-1].punch_type !== 'IN';
+          
+          if (isFirstPunch || hasNoPreviousIN) {
+            const errorMsg = `OUT matinal suspect à ${timeStr} sans IN préalable`;
+            
+            // Correction automatique conditionnelle
+            if (isFirstPunch && punch.punch_source === 'AUTO') {
+              console.log('  → Correction automatique: conversion en IN');
+              allCorrections.push({
+                id: punch.id,
+                newType: 'IN',
+                newSource: 'AUTO_CORRECTED'
+              });
+              allNotifications.push({
+                employeeId: employee_id,
+                type: 'CORRECTION_AUTO',
+                message: `OUT matinal converti en IN pour ${employeeData.name} (${employee_id}) le ${dayKey} à ${timeStr}`
+              });
+              expectedNextType = 'OUT';
+              continue;
+            } else {
+              allReviews.push({
+                id: punch.id,
+                reason: errorMsg
+              });
+              allNotifications.push({
+                employeeId: employee_id,
+                type: 'POINTAGE_SUSPECT',
+                message: `${errorMsg} pour ${employeeData.name} (${employee_id}) le ${dayKey}`
+              });
+              dayIssues++;
+            }
+          }
+        }
+
+        // Vérification séquence IN/OUT
+        if (i === 0 && punch.punch_type !== 'IN') {
+          console.log(`  ❌ Premier pointage devrait être IN (${punch.punch_type})`);
+          allReviews.push({
+            id: punch.id,
+            reason: 'Premier pointage devrait être IN'
+          });
+          dayIssues++;
+          expectedNextType = 'OUT';
+          continue;
+        }
+
+        if (expectedNextType && punch.punch_type !== expectedNextType) {
+          console.log(`  ❌ Séquence incorrecte: attendu ${expectedNextType}, trouvé ${punch.punch_type}`);
+          
+          // Correction automatique si inversion simple détectée
+          if (i < dayShiftPunches.length - 1 && 
+              dayShiftPunches[i+1].punch_type === expectedNextType &&
+              punch.punch_source === 'AUTO') {
+            console.log('  → Correction automatique: inversion détectée');
+            allCorrections.push({
+              id: punch.id,
+              newType: expectedNextType,
+              newSource: 'AUTO_CORRECTED'
+            });
+          } else {
+            allReviews.push({
+              id: punch.id,
+              reason: `Séquence incorrecte: attendu ${expectedNextType} après ${dayShiftPunches[i-1].punch_type}`
+            });
+          }
+          dayIssues++;
+        }
+        
+        expectedNextType = punch.punch_type === 'IN' ? 'OUT' : 'IN';
+
+        // Vérification intervalle temporel
+        if (i > 0) {
+          const prevPunch = dayShiftPunches[i-1];
+          const prevTime = new Date(prevPunch.punch_time);
+          const timeDiff = (punchTime - prevTime) / (1000 * 60); // minutes
+          
+          // Intervalle trop court (<2 min)
+          if (timeDiff < 2) {
+            console.log(`  ⚠ Intervalle très court: ${timeDiff.toFixed(1)} minutes`);
+            allReviews.push({
+              id: punch.id,
+              reason: `Intervalle très court (${timeDiff.toFixed(1)} min)`
+            });
+            dayIssues++;
+          }
+          
+          // Pause longue (>15h entre OUT et IN suivant)
+          if (prevPunch.punch_type === 'OUT' && punch.punch_type === 'IN' && timeDiff > 60 * 15) {
+            console.log(`  ⚠ Pause longue: ${(timeDiff/60).toFixed(1)} heures`);
+            allNotifications.push({
+              employeeId: employee_id,
+              type: 'PAUSE_LONGUE',
+              message: `Pause longue de ${(timeDiff/60).toFixed(1)}h pour ${employeeData.name} (${employee_id}) le ${dayKey}`
+            });
+          }
+        }
+        
+      } catch (err) {
+        console.error(`  ❌ Erreur traitement:`, err.message);
+        allReviews.push({
+          id: punch.id,
+          reason: `Erreur traitement: ${err.message.slice(0, 100)}`
+        });
+        dayIssues++;
+      }
+    }
+    
+    if (dayIssues > 0) {
+      console.log(`  → ${dayIssues} problèmes détectés`);
+    } else {
+      console.log('  ✓ Aucune incohérence détectée');
+    }
+
+    // 5. Exécution des mises à jour
+    // Corrections automatiques
+    if (allCorrections.length > 0) {
+      await pool.query(`
+        UPDATE attendance_records ar
+        SET punch_type = c.newType,
+            punch_source = c.newSource
+        FROM (VALUES ${allCorrections.map((c, i) => 
+          `($${i*3+1}, $${i*3+2}, $${i*3+3})`
+        ).join(',')}) AS c(id, newType, newSource)
+        WHERE ar.id = c.id::integer`,
+        allCorrections.flatMap(c => [c.id, c.newType, c.newSource])
+      );
+      console.log(`✓ ${allCorrections.length} corrections appliquées`);
+    }
+    
+    // Marquages pour revue
+    if (allReviews.length > 0) {
+      await pool.query(`
+        UPDATE attendance_records ar
+        SET needs_review = TRUE,
+            review_reason = r.reason
+        FROM (VALUES ${allReviews.map((r, i) => 
+          `($${i*2+1}, $${i*2+2})`
+        ).join(',')}) AS r(id, reason)
+        WHERE ar.id = r.id::integer`,
+        allReviews.flatMap(r => [r.id, r.reason])
+      );
+      console.log(`✓ ${allReviews.length} pointages marqués pour revue`);
+    }
+    
+    // Notifications RH
+    if (allNotifications.length > 0) {
+      await pool.query(`
+        INSERT INTO hr_notifications 
+        (employee_id, notification_type, message, created_at)
+        VALUES ${allNotifications.map((_, i) => 
+          `($${i*3+1}, $${i*3+2}, $${i*3+3}, NOW())`
+        ).join(',')}`,
+        allNotifications.flatMap(n => [n.employeeId, n.type, n.message])
+      );
+      console.log(`✓ ${allNotifications.length} notifications créées`);
+    }
+
+    console.log('[Fin] Correction terminée pour ce jour');
+  } catch (error) {
+    console.error('[ERREUR dans verifyAndFixPunchSequenceForDay]', error.stack);
+    throw error;
+  }
+}
 
 
 // Récupérer les stats depuis table monthly_attendance pour le tableau de bord

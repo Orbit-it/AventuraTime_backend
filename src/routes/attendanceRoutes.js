@@ -1,7 +1,7 @@
 const express = require("express");
 const Notification = require("../models/Notification");
 const { getAttendanceStats, addAttendance, getWeekAttendanceSummary, getDashboardDatas, getNotifications,
-   updateAttendance, getAttendanceWithMultipleShifts, addManualAttendance, markNotificationAsRead,
+   updateAttendance, getAttendanceWithMultipleShifts, addManualAttendance, markNotificationAsRead, deletePointage, getWeekAttendanceData,
     getAttendanceSummary, importAttendances } =  require("../controllers/attendanceController");
 const multer = require('multer');
 
@@ -26,11 +26,12 @@ const upload = multer({
 router.post("/attendances", addAttendance); // Ajouter un pointage
 router.get("/attendances", getAttendanceWithMultipleShifts); // Liste des pointages
 router.put("/attendances/:id", updateAttendance); // Mettre à jour un pointage
+router.delete('/attendances/:id', deletePointage);  // supprimer un pointage
 router.get("/summary", getAttendanceSummary); // Recupérer les pointages calculés
 router.post('/import-excel', upload.single('file'), importAttendances);
 router.get('/attendance-stats/:start_date/:end_date/:employee_id?', getAttendanceStats);
 router.post('/manual-attendance', addManualAttendance); // Ajouter un pointage manuel
-router.get('/weekly-attendance', getWeekAttendanceSummary); // Récupérer les pointages hebdomadaires
+router.get('/weekly-attendance', getWeekAttendanceData); // Récupérer les pointages hebdomadaires
 router.get('/dashboard', getDashboardDatas);
 router.get('/notif', getNotifications);
 router.post('/notifications/mark-as-read', markNotificationAsRead);
