@@ -1,4 +1,5 @@
 const Layoff = require('../models/Layoff');
+const { apresAjoutIndisponibility } = require('../services/attendanceService');
 
 
 // créer une nouvelle mise à pied
@@ -6,6 +7,8 @@ exports.addLayoff = async (req, res) => {
   try {
     const { employee_id, type, start_date, end_date, nb_jour } = req.body;
     const newLayoff = await Layoff.create({ employee_id, type, start_date, end_date, nb_jour });
+    await apresAjoutIndisponibility(start_date, end_date, employee_id);
+   
     res.status(201).json(newLayoff);
   } catch (error) {
     res.status(400).json({ error: error.message });

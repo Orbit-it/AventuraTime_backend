@@ -906,8 +906,8 @@ async function processRegularShifts(employeeId) {
     const REGULAR_SHIFT_END_MINUTES = 20 * 60 + 59;   // 8:59 PM (20:59)
     const MIN_WORK_HOURS = 0; // Minimum worked hours can't be negative
     const HOURS_PRECISION = 2; // Decimal places for hours calculations
-    const startDate = '2025-05-25';
-    const endDate = '2025-05-27';
+    const startDate = '2025-05-26';
+    const endDate = '2025-06-10';
 
 
     if (!Number.isInteger(Number(employeeId))) {
@@ -1103,10 +1103,6 @@ async function processRegularShifts(employeeId) {
                     Math.max(workedHours - breakDuration, MIN_WORK_HOURS).toFixed(HOURS_PRECISION)
                 );
 
-            
-
-                
-                
 
                 // 7. Update the summary record
                 await client.query(`
@@ -1140,31 +1136,38 @@ async function processRegularShifts(employeeId) {
                             WHEN $4::TIME < getout_ref THEN 1
                             ELSE 0
                         END,    
-                        hours_worked = $7::NUMERIC,
+                        hours_worked = CASE
+                            WHEN is_sunday THEN 0
+                            ELSE $7::NUMERIC
+                        END,
                         sunday_hour = CASE
                         WHEN is_sunday = TRUE THEN $7::NUMERIC
                         ELSE 0
                         END,
                         sup_hour = CASE
-                        WHEN is_saturday = TRUE THEN GREATEST($7::NUMERIC - normal_hours::NUMERIC, 0 )
-                        ELSE 0
+                        WHEN is_saturday = TRUE AND getin_ref is NULL THEN $7::NUMERIC
+                        ELSE GREATEST($7::NUMERIC - normal_hours::NUMERIC, 0 )
                         END,
-                        missed_hour = GREATEST((normal_hours::NUMERIC - hours_worked::NUMERIC), 0 ),
-                        penalisable = GREATEST(normal_hours::NUMERIC - hours_worked::NUMERIC, 0 ),
+                        missed_hour = GREATEST(COALESCE(normal_hours::NUMERIC, 0) - COALESCE(hours_worked::NUMERIC, 0), 0 ),
+                        penalisable = GREATEST(COALESCE(normal_hours::NUMERIC, 0) - COALESCE(hours_worked::NUMERIC, 0), 0 ),
                         updated_at = NOW()
                     WHERE employee_id = $1 AND date = $2
-                    AND isholidays = FALSE AND is_conge = FALSE AND islayoff = FALSE 
-                    AND is_congex = FALSE AND (do_not_touch IS NULL OR do_not_touch = FALSE)
-                    AND is_maladie = FALSE AND is_accident = FALSE;
+                    AND isholidays IS NOT TRUE 
+                    AND is_conge IS NOT TRUE 
+                    AND islayoff IS NOT TRUE  
+                    AND is_congex IS NOT TRUE  
+                    AND do_not_touch IS NOT TRUE
+                    AND is_maladie IS NOT TRUE  
+                    AND is_accident IS NOT TRUE ;
                 `, [
-                    employeeId, 
-                    shift.shift_date, 
-                    getin || null,  // <-- S'assurer que `null` est utilisé au lieu de `NaN`
-                    getout || null, 
-                    autoriz_getin || null, 
-                    autoriz_getout || null, 
-                    workedHours || 0,
-                    is_anomalie,
+                    employeeId, //$1
+                    shift.shift_date,   //$2
+                    getin || null,  //$3
+                    getout || null, //$4
+                    autoriz_getin || null, //$5
+                    autoriz_getout || null, //$6
+                    workedHours || 0,   //$7
+                    is_anomalie,   //$8
                 ]);
                 
 
@@ -1185,9 +1188,7 @@ async function processRegularShifts(employeeId) {
 }
 
 // Fonction pour mettre à jour les valeurs d'absences en cas d'heure travaillée non pénalisable
-async function processMissedHours(employeeId) {
-    const date = '2025-05-26'; // À remplacer par dynamique si besoin
-
+async function processMissedHours(employeeId, date) {
     if (!Number.isInteger(Number(employeeId))) {
         throw new Error(`Invalid employee ID: ${employeeId}`);
     }
@@ -1199,21 +1200,34 @@ async function processMissedHours(employeeId) {
             UPDATE attendance_summary
             SET 
                 nbr_absence = CASE
-                    WHEN normal_hours::NUMERIC > 0 THEN 0
+                    WHEN COALESCE(normal_hours, 0)::NUMERIC > 0 THEN 0
                     ELSE nbr_absence
                 END,     
-                missed_hour = GREATEST(normal_hours::NUMERIC - hours_worked::NUMERIC, 0),
-                penalisable = GREATEST(normal_hours::NUMERIC - hours_worked::NUMERIC, 0),
+                missed_hour = CASE 
+                    WHEN getin_ref IS NULL THEN 0
+                    ELSE GREATEST(
+                        COALESCE(normal_hours, 0)::NUMERIC - COALESCE(hours_worked, 0)::NUMERIC, 0
+                    )
+                END,
+                penalisable = CASE
+                    WHEN getin_ref IS NULL THEN 0
+                    ELSE GREATEST(
+                        COALESCE(normal_hours, 0)::NUMERIC 
+                        - COALESCE(hours_worked, 0)::NUMERIC 
+                        - COALESCE(night_hours, 0)::NUMERIC, 
+                        0
+                    )
+                END,
                 updated_at = NOW()
             WHERE employee_id = $1 
               AND date = $2
-              AND isholidays = FALSE 
-              AND is_conge = FALSE 
-              AND islayoff = FALSE 
-              AND is_congex = FALSE 
-              AND (do_not_touch IS NULL OR do_not_touch = FALSE)
-              AND is_maladie = FALSE 
-              AND is_accident = FALSE;
+              AND isholidays IS NOT TRUE 
+              AND is_conge IS NOT TRUE 
+              AND islayoff IS NOT TRUE 
+              AND is_congex IS NOT TRUE 
+              AND do_not_touch IS NOT TRUE 
+              AND is_maladie IS NOT TRUE  
+              AND is_accident IS NOT TRUE;
         `, [employeeId, date]);
 
         console.log(`✓ Heures manquées mises à jour pour l'employé ${employeeId} - ${date}`);
@@ -1223,6 +1237,7 @@ async function processMissedHours(employeeId) {
         client.release();
     }
 }
+
 
 
 
@@ -1487,7 +1502,7 @@ async function attendanceSummary(employeeId,employee_innerID, date) {
         await processNightShifts(employeeId);
 
         // Mis à jour des Heures d'absence TEST PHASE
-        await processMissedHours(employeeId);
+        await processMissedHours(employeeId, date);
 
         // Nettoyage des attendance_summary
         await deleteUnusedAttendanceSummary(employeeId);
@@ -1502,8 +1517,8 @@ async function attendanceSummary(employeeId,employee_innerID, date) {
 
 // fonction pour traiter les pointages sur une période donnée
 async function processMonthlyAttendance() {
-    const startDate = '2025-05-25'; // Première date de la période (exemple: 1er mars 2025)
-    const endDate = '2025-05-27'; // Dernière date de la période (exemple: 31 mars 2025)
+    const startDate = '2025-05-26'; // Première date de la période (exemple: 1er mars 2025)
+    const endDate = '2025-06-10'; // Dernière date de la période (exemple: 31 mars 2025)
 
     const client = await pool.connect();
     try {
@@ -1544,6 +1559,50 @@ async function processMonthlyAttendance() {
     }
 }
 
+// fonction pour traiter les pointages sur une période donnée
+async function apresAjoutIndisponibility(start_date, end_date, employee_id) {
+    const startDate = start_date; 
+    const endDate = end_date;
+    const employeeId = employee_id;
+
+    const client = await pool.connect();
+    try {
+        console.log(`📅 Traitement des résumés d'attendance entre ${startDate} et ${endDate}`);
+
+        // Récupérer les données de l'employé
+        const employeesQuery = 'SELECT id, attendance_id FROM employees WHERE id = $1';
+        const employeesResult = await client.query(employeesQuery, [employeeId]); // You need to pass the employeeId as a parameter
+
+        // Vérifier qu'il y a des les données de l'employé
+        if (employeesResult.rows.length === 0) {
+            console.log('Aucune donnée trouvée.');
+            return;
+        }
+
+        // Boucle et application de la fonction attendanceSummary pour chaque date de la période
+        for (let currentDate = new Date(startDate); currentDate <= new Date(endDate); currentDate.setDate(currentDate.getDate() + 1)) {
+            const dateString = currentDate.toISOString().split('T')[0]; // Format YYYY-MM-DD
+            console.log(`🌟 Traitement des présences pour la date ${dateString}`);
+
+            // Appliquer la fonction attendanceSummary  à la date spécifique
+            for (const employee of employeesResult.rows) {
+                try {
+                    await attendanceSummary(employee.attendance_id,employee.id, dateString);
+                } catch (error) {
+                    console.error(`❌ Erreur lors du traitement de l'attendance pour l'employé ${employee.attendance_id} à la date ${dateString}:`, error);
+                }
+            }
+        }
+
+        console.log(`✅ Traitement des résumés d'attendance terminé pour tous les employés.`);
+
+    } catch (error) {
+        console.error('❌ Erreur lors du traitement des résumés d\'attendances mensuels:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
 
 
 // mis à jour de attendance summary après ajout ou modification de pointage manuel
@@ -2025,7 +2084,7 @@ async function downloadAttendance(machine) {
 
         
     
-        const startDate = moment().subtract(1, 'month').date(26).startOf('day').toDate();
+        const startDate = moment().subtract(1, 'month').date(25).startOf('day').toDate();
 
         console.log("📆 Téléchargement des pointages depuis :", startDate.toISOString());
 
@@ -2246,18 +2305,17 @@ async function update_week_attendance() {
     try {
         console.log("🔄 Mise à jour des totaux dans week_attendance");
 
-        // 1. Récupérer tous les employés
         const { rows: employees } = await client.query('SELECT id, attendance_id FROM employees');
         if (employees.length === 0) {
             console.log('Aucun employé trouvé.');
             return;
         }
 
-        // 2. Requête pour récupérer les totaux par semaine pour un employé
         const getWeeklySummaryQuery = `
             SELECT 
                 SUM(night_hours) as total_night_hours,
                 SUM(hours_worked) as total_worked_hours,
+                SUM(normal_hours) as total_normal_hours,
                 SUM(penalisable) as total_penalisable,
                 SUM(sup_hour) as total_sup,
                 SUM(missed_hour) as total_missed_hours,
@@ -2270,13 +2328,13 @@ async function update_week_attendance() {
             WHERE employee_id = $1 AND date BETWEEN $2 AND $3
         `;
 
-        // 3. Requête de mise à jour
         const updateQuery = `
             UPDATE week_attendance
             SET 
                 total_night_hours = $4,
                 total_worked_hours = $5,
                 total_penalisable = $6,
+                total_normal_hour = $14,
                 total_sup = $7,
                 total_missed_hours = $8,
                 total_sunday_hours = $9,
@@ -2287,40 +2345,54 @@ async function update_week_attendance() {
             WHERE name = $1 AND employee_id = $2 AND start_date = $3
         `;
 
-        // 4. Pour chaque employé, récupérer ses semaines existantes
         for (const employee of employees) {
             try {
                 await client.query('BEGIN');
 
-                // Récupérer toutes les semaines existantes pour cet employé
                 const { rows: weeks } = await client.query(
                     'SELECT name, start_date, end_date FROM week_attendance WHERE employee_id = $1 ORDER BY start_date',
                     [employee.attendance_id]
                 );
 
                 for (const week of weeks) {
-                    // Récupérer les données hebdomadaires
                     const { rows: [weeklyData] } = await client.query(getWeeklySummaryQuery, [
                         employee.attendance_id,
                         week.start_date,
                         week.end_date
                     ]);
 
-                    // Mettre à jour les données de la semaine
+                    const totalNormal = parseFloat(weeklyData.total_normal_hours) || 0;
+                    const totalWorked = parseFloat(weeklyData.total_worked_hours) || 0;
+                    const totalNighthour = parseFloat(weeklyData.total_night_hours) || 0;
+                    const totalMissedhour =  parseFloat(weeklyData.total_missed_hours) || 0;
+                    const totalSup50 = parseFloat(weeklyData.total_sup) || 0;
+                    let totalsup = Math.max((totalWorked - 48), 0); // Heure sup calculé au delà de 48h par semaine !
+                    const compasedHour = totalMissedhour - totalSup50;
+                    const totalMissed = Math.max(compasedHour, 0);  
+                    const totalPenalisable = Math.max((totalMissed - totalNighthour), 0);
+
+                    if (compasedHour > 0) {
+                        totalsup -= compasedHour ;
+                        keepsuppositif = Math.max(totalsup, 0);
+                        totalsup =  keepsuppositif;
+                    };
+                
+
                     await client.query(updateQuery, [
-                        week.name,
-                        employee.attendance_id,
-                        week.start_date,
-                        parseFloat(weeklyData.total_night_hours) || 0,
-                        parseFloat(weeklyData.total_worked_hours) || 0,
-                        parseFloat(weeklyData.total_penalisable) || 0,
-                        parseFloat(weeklyData.total_sup) || 0,
-                        parseFloat(weeklyData.total_missed_hours) || 0,
-                        parseFloat(weeklyData.total_sunday_hours) || 0,
-                        parseInt(weeklyData.total_jf) || 0,
-                        parseInt(weeklyData.total_jc) || 0,
-                        parseInt(weeklyData.total_htjf) || 0,
-                        parseInt(weeklyData.total_jcx) || 0
+                        week.name,                                      // $1
+                        employee.attendance_id,                         // $2
+                        week.start_date,                                // $3
+                        parseFloat(weeklyData.total_night_hours) || 0,  // $4
+                        totalWorked,                                    // $5
+                        totalPenalisable,                               // $6
+                        totalsup,                                       // $7
+                        totalMissed,                                    // $8
+                        parseFloat(weeklyData.total_sunday_hours) || 0, // $9
+                        parseInt(weeklyData.total_jf) || 0,             // $10
+                        parseInt(weeklyData.total_jc) || 0,             // $11
+                        parseInt(weeklyData.total_htjf) || 0,           // $12
+                        parseInt(weeklyData.total_jcx) || 0,            // $13
+                        totalNormal                                     // $14
                     ]);
                 }
 
@@ -2328,18 +2400,19 @@ async function update_week_attendance() {
                 console.log(`✓ ${weeks.length} semaines mises à jour pour l'employé ${employee.attendance_id}`);
             } catch (error) {
                 await client.query('ROLLBACK');
-                console.error(`Erreur lors de la mise à jour pour l'employé ${employee.attendance_id}:`, error);
+                console.error(`❌ Erreur pour l'employé ${employee.attendance_id}:`, error.message);
             }
         }
 
         console.log(`✅ Totaux mis à jour pour ${employees.length} employés`);
     } catch (error) {
-        console.error("❌ Erreur lors de la mise à jour des totaux:", error);
+        console.error("❌ Erreur globale:", error);
         throw error;
     } finally {
         client.release();
     }
 }
+
 
 // Fonction pour mettre à jour les week_attendance après mis à jour d'un attendance_summary d'un employé
 async function update_week_attendance_by_employee( employeeId, date) {
@@ -2683,5 +2756,6 @@ module.exports = {
     init_month_attendance,
     verifyAndFixPunchSequence,
     processManualAttendance,
-    updateAttendanceSummaryFromTimes
+    updateAttendanceSummaryFromTimes,
+    apresAjoutIndisponibility
 };

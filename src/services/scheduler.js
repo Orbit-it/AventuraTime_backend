@@ -22,11 +22,11 @@ async function runAttendanceJob() {
 
 cron.schedule('28 17 * * *', init_month_attendance ); // Appel de creation des weekly attendance
 
-cron.schedule('16 15 * * *', init_week_attendance ); // Appel de creation des weekly attendance
-cron.schedule('15 12 * * *', update_week_attendance ); // Appel de mise à jour de la table week_attendance
+//cron.schedule('16 15 * * *', init_week_attendance ); // Appel de creation des weekly attendance
+cron.schedule('40 16 * * *', update_week_attendance ); // Appel de mise à jour de la table week_attendance
 // cron.schedule('47 11 * * *', processAllAttendances ); // Mettre à jour les poinatages journaliers sur attendance_summary
- cron.schedule('52 14 * * *', processMonthlyAttendance ); // 
- cron.schedule('03 12 * * *', classifyAllPunchesWithLogs ); // Classification des Poinatges en IN et OUT
+ cron.schedule('04 12 * * *', processMonthlyAttendance ); // 
+ cron.schedule('02 12 * * *', classifyAllPunchesWithLogs ); // Classification des Poinatges en IN et OUT
  //cron.schedule('16 10 * * *', verifyAndFixPunchSequence ); // Verification et correction des sequences IN / OUT et notif du Service RH
 
 
