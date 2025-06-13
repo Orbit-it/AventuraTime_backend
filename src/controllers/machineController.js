@@ -61,7 +61,9 @@ exports.downloadAttendance = async (req, res) => {
     const data = await machineService.downloadAttendance(machine);
     res.json(data);
 
-    await machineService.updateAttendanceSummary(); // Mettre à jour après chak Téléchargement de pointage
+    await machineService.classifyAllPunchesWithLogs(); // Classifie les pointages après chaque Téléchargement de pointage
+
+    await machineService.processMonthlyAttendance();  // Calcule et Met à jour les pointages
 
   } catch (error) {
     res.status(500).json({ error: error.message });

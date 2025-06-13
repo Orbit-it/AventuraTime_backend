@@ -1,7 +1,8 @@
 const express = require("express");
 const Notification = require("../models/Notification");
 const { getAttendanceStats, addAttendance, getWeekAttendanceSummary, getDashboardDatas, getNotifications,
-   updateAttendance, getAttendanceWithMultipleShifts, addManualAttendance, markNotificationAsRead, deletePointage, getWeekAttendanceData,
+   updateAttendance, getAttendanceWithMultipleShifts, addManualAttendance, markNotificationAsRead, deletePointage,
+    getWeekAttendanceData, getMissedbyInterval, getTodayAbsences,
     getAttendanceSummary, importAttendances } =  require("../controllers/attendanceController");
 const multer = require('multer');
 
@@ -34,6 +35,7 @@ router.post('/manual-attendance', addManualAttendance); // Ajouter un pointage m
 router.get('/weekly-attendance', getWeekAttendanceData); // Récupérer les pointages hebdomadaires
 router.get('/dashboard', getDashboardDatas);
 router.get('/notif', getNotifications);
+router.get('/absences', getTodayAbsences);  // recupérer les pointages en stats
 router.post('/notifications/mark-as-read', markNotificationAsRead);
 
 

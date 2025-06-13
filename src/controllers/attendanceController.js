@@ -6,7 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const { response } = require("express");
 const { ok } = require("assert");
-const { processManualAttendance, updateAttendanceSummaryFromTimes } = require('../services/attendanceService');
+const { processManualAttendance, updateAttendanceSummaryFromTimes,
+   classifyAllPunchesWithLogs, processMonthlyAttendance } = require('../services/attendanceService');
 
 const moment = require('moment');
 
@@ -33,7 +34,6 @@ exports.importAttendances = async (req, res) => {
     for (const [index, record] of attendanceData.entries()) {
       try {
         const rawDate = record.Date;
-        console.log("📅 Date brute depuis CSV:", rawDate);
 
         const excelSerialNumber = parseFloat(rawDate);
         if (isNaN(excelSerialNumber)) {
@@ -150,6 +150,10 @@ exports.importAttendances = async (req, res) => {
     }
 
     fs.unlinkSync(filePath);
+
+    await classifyAllPunchesWithLogs(); // Calssificartion des pointages après importation
+
+    await processMonthlyAttendance();  // Calcul et mis à jour des pointages
 
     return res.json({
       success: true,
@@ -1177,6 +1181,187 @@ exports.getDashboardDatas = async (req, res) => {
         params: req.params,
         query: req.query
       }
+    });
+  }
+};
+
+exports.getMissedbyInterval = async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+
+    // Set default dates (current month)
+    const startDate = start_date || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const endDate = end_date || new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0);
+
+    // Query to get active employees
+    const employeeQuery = `
+      SELECT id, name, attendance_id
+      FROM employees
+      WHERE is_active = TRUE
+    `;
+    const employeeResult = await pool.query(employeeQuery);
+    const activeEmployees = employeeResult.rows; // Changed from emps to rows
+    const activeEmployeeCount = activeEmployees.length;
+
+    if (activeEmployeeCount === 0) {
+      return res.json({
+        taux_presence: 0,
+        taux_absence: 0,
+        total_absence: 0,
+        message: "No active employees found"
+      });
+    }
+
+    // Query to get missed attendances
+    const attendanceQuery = `
+      SELECT
+        employee_id,
+        date
+      FROM attendance_summary
+      WHERE date BETWEEN $1 AND $2 
+      AND getin_ref IS NOT NULL 
+      AND hours_worked IS NULL 
+      AND isholidays IS NOT TRUE
+      AND islayoff IS NOT TRUE
+      AND has_night_shift IS NOT TRUE
+    `;
+    const attendanceParams = [startDate, endDate];
+    const attendanceResult = await pool.query(attendanceQuery, attendanceParams);
+    const missedAttendances = attendanceResult.rows;
+    const totalAbsence = missedAttendances.length;
+
+    // Calculate rates
+    const tauxAbsence = totalAbsence > 0 ? 
+      ((totalAbsence / activeEmployeeCount) * 100).toFixed(2) : 0;
+    const tauxPresence = (100 - tauxAbsence).toFixed(2);
+
+    const response = {
+      taux_presence: parseFloat(tauxPresence),
+      taux_absence: parseFloat(tauxAbsence),
+      total_absence: totalAbsence,
+      active_employees: activeEmployeeCount
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching attendance stats:', error);
+    res.status(500).json({ 
+      error: 'Erreur serveur lors de la récupération des statistiques',
+      details: error.message,
+      request_details: {
+        params: req.params,
+        query: req.query
+      }
+    });
+  }
+};
+
+exports.getTodayAbsences = async (req, res) => {
+  try {
+    // Date d'aujourd'hui
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // 1. Récupérer tous les employés actifs
+    const employeeQuery = `
+      SELECT id, name, attendance_id 
+      FROM employees 
+      WHERE is_active = TRUE
+    `;
+    const employeeResult = await pool.query(employeeQuery);
+    const activeEmployees = employeeResult.rows;
+    const activeEmployeeCount = activeEmployees.length;
+
+    if (activeEmployeeCount === 0) {
+      return res.json({
+        success: true,
+        message: "Aucun employé actif trouvé",
+        data: {
+          date: today.toISOString().split('T')[0],
+          total_employees: 0,
+          absences: []
+        }
+      });
+    }
+
+    // 2. Récupérer les présences enregistrées aujourd'hui
+    const presentQuery = `
+      SELECT DISTINCT employee_id
+      FROM attendance_summary
+      WHERE date = $1
+      AND (hours_worked IS NOT NULL OR getin_ref IS NOT NULL)
+    `;
+    const presentResult = await pool.query(presentQuery, [today]);
+    const presentEmployeeIds = presentResult.rows.map(row => row.employee_id);
+
+    // 3. Identifier les absents (actifs non présents)
+    const absentEmployees = activeEmployees.filter(emp => 
+      !presentEmployeeIds.includes(emp.id)
+    );
+
+    // 4. Récupérer les cas spéciaux (même s'ils ont une entrée)
+    const specialCasesQuery = `
+      SELECT employee_id
+      FROM attendance_summary
+      WHERE date = $1
+      AND getin_ref IS NOT NULL
+      AND hours_worked IS NULL
+      AND isholidays IS NOT TRUE
+      AND islayoff IS NOT TRUE
+      AND has_night_shift IS NOT TRUE
+    `;
+    const specialCasesResult = await pool.query(specialCasesQuery, [today]);
+    const specialCaseIds = specialCasesResult.rows.map(row => row.employee_id);
+
+    // 5. Combiner les listes (absents + cas spéciaux)
+    const allAbsentEmployees = [
+      ...absentEmployees.map(emp => ({...emp, absence_type: 'no_check'})),
+      ...activeEmployees
+        .filter(emp => specialCaseIds.includes(emp.id))
+        .map(emp => ({...emp, absence_type: 'checked_but_no_work'}))
+    ];
+
+    // 6. Calculer les statistiques
+    const totalAbsence = allAbsentEmployees.length;
+    const tauxAbsence = (totalAbsence / activeEmployeeCount * 100).toFixed(2);
+    const tauxPresence = (100 - tauxAbsence).toFixed(2);
+
+    // 7. Préparer la réponse
+    const response = {
+      date: today.toISOString().split('T')[0],
+      total_employees: activeEmployeeCount,
+      present_employees: activeEmployeeCount - totalAbsence,
+      absent_employees: totalAbsence,
+      absence_rate: parseFloat(tauxAbsence),
+      presence_rate: parseFloat(tauxPresence),
+      absences: allAbsentEmployees.map(emp => ({
+        employee_id: emp.id,
+        name: emp.name,
+        attendance_id: emp.attendance_id,
+        absence_type: emp.absence_type,
+        absence_label: emp.absence_type === 'no_check' 
+          ? 'Aucun pointage' 
+          : 'Pointé mais pas de temps travaillé'
+      })),
+      summary: {
+        by_type: {
+          no_check: absentEmployees.length,
+          checked_but_no_work: specialCaseIds.length
+        }
+      }
+    };
+
+    res.json({
+      success: true,
+      data: response
+    });
+
+  } catch (error) {
+    console.error('Erreur:', error);
+    res.status(500).json({
+      success: false,
+      error: "Erreur serveur",
+      details: error.message
     });
   }
 };
