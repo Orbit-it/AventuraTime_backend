@@ -10,6 +10,7 @@ const Employees = db.define(
       password: { type: DataTypes.STRING, allowNull: true },
       role: { type: DataTypes.STRING, allowNull: true },
       payroll_id: { type: DataTypes.STRING, allowNull: false },
+      plafond: { type: DataTypes.NUMBER, allowNull: true },
       attendance_id: { type: DataTypes.STRING, allowNull: false },
       position: { type: DataTypes.STRING, allowNull: true },
       cnss_number: { type: DataTypes.STRING, allowNull: true },

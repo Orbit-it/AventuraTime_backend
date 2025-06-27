@@ -1482,15 +1482,25 @@ async function update_week_attendance() {
                 SUM(hours_worked) as total_worked_hours,
                 SUM(normal_hours) as total_normal_hours,
                 SUM(penalisable) as total_penalisable,
+                SUM(jf_value) as total_jf,
                 SUM(sup_hour) as total_sup,
                 SUM(missed_hour) as total_missed_hours,
                 SUM(sunday_hour) as total_sunday_hours,
-                SUM(jf_value) as total_jf,
-                SUM(jc_value) as total_jc,
-                SUM(worked_hours_on_holidays) as total_htjf,
-                SUM(jcx_value) as total_jcx
+                SUM(worked_hours_on_holidays) as total_htjf
             FROM attendance_summary
-            WHERE employee_id = $1 AND date BETWEEN $2 AND $3
+            WHERE employee_id = $1 AND status <> 'map' AND status <> 'conge'
+            AND date BETWEEN $2 AND $3
+        `;
+
+        const getWeeklySummaryQuery_exclude = `
+            SELECT 
+                SUM(missed_hour) as exclude_missed_hours,
+                SUM(jc_value) as exclude_jc,
+                SUM(jcx_value) as exclude_jcx
+            FROM attendance_summary
+            WHERE employee_id = $1 
+            AND (status = 'map' OR status = 'conge')
+            AND date BETWEEN $2 AND $3
         `;
 
         const updateQuery = `
@@ -1520,11 +1530,20 @@ async function update_week_attendance() {
                 );
 
                 for (const week of weeks) {
+
                     const { rows: [weeklyData] } = await client.query(getWeeklySummaryQuery, [
                         employee.attendance_id,
                         week.start_date,
                         week.end_date
                     ]);
+
+                    // ecluded sum
+                    const { rows: [excludeData] } = await client.query(getWeeklySummaryQuery_exclude, [
+                        employee.attendance_id,
+                        week.start_date,
+                        week.end_date
+                    ]);
+                    const excludeMissedhour =  parseFloat(excludeData.exclude_missed_hours) || 0; // heure absence non compensées
 
                     const totalNormal = parseFloat(weeklyData.total_normal_hours) || 0;
                     const totalWorked = parseFloat(weeklyData.total_worked_hours) || 0;
@@ -1533,7 +1552,7 @@ async function update_week_attendance() {
                     const totalSup50 = parseFloat(weeklyData.total_sup) || 0;
                     let totalsup = Math.max((totalWorked - 48), 0); // Heure sup calculé au delà de 48h par semaine !
                     const compasedHour = totalMissedhour - totalSup50;
-                    const totalMissed = Math.max(compasedHour, 0);  
+                    const totalMissed = Math.max(compasedHour, 0) + excludeMissedhour;  
                     const totalPenalisable = Math.max((totalMissed - totalNighthour), 0);
 
                     if (compasedHour > 0) {
@@ -1554,9 +1573,9 @@ async function update_week_attendance() {
                         totalMissed,                                    // $8
                         parseFloat(weeklyData.total_sunday_hours) || 0, // $9
                         parseInt(weeklyData.total_jf) || 0,             // $10
-                        parseInt(weeklyData.total_jc) || 0,             // $11
+                        parseInt(excludeData.exclude_jc) || 0,             // $11
                         parseInt(weeklyData.total_htjf) || 0,           // $12
-                        parseInt(weeklyData.total_jcx) || 0,            // $13
+                        parseInt(excludeData.exclude_jcx) || 0,            // $13
                         totalNormal                                     // $14
                     ]);
                 }
@@ -1618,7 +1637,7 @@ async function attendanceSummary(employeeId,employee_innerID, date) {
 // fonction pour traiter les pointages sur une période donnée
 async function processMonthlyAttendance() {
 
-    // Calcul dynamique de la période : aujourd'hui et 3 jours avant
+    // Calcul dynamique de la période : aujourd'hui et 3/1 jours avant
     const today = new Date();
     const endDate = today.toISOString().split('T')[0];
 
@@ -1657,6 +1676,12 @@ async function processMonthlyAttendance() {
 
         // Mise à jour des totaux hebdomadaire
         await update_week_attendance();
+        
+        // Mise à jour des totaux mensuel
+        await update_monthly_attendance();
+
+        // Mise à jour de la prime d'assiduité
+        await prime_assiduite();
 
         console.log(`✅ Traitement des résumés d'attendance terminé pour tous les employés.`);
 
@@ -2417,6 +2442,145 @@ async function init_week_attendance(month = moment().startOf('month')) {
     }
 }
 
+// Fonction pour créer des données sur la table mensuel
+async function init_monthly_attendance(month = moment().startOf('month')) {
+    const client = await pool.connect();
+    try {
+        console.log("📅 Création des semaines sur la table week_attendance");
+
+        // Fonction pour générer les semaines
+        const generatePayPeriodWeeks = (payMonth) => {
+            const startDate = payMonth.clone().subtract(1, 'month').date(26);
+            const endDate = payMonth.clone().date(25);
+            let currentStart = startDate.clone();
+            const generatedWeeks = [];
+            let weekNum = 1;
+
+            // Format du mois de paie pour le nom (ex: "JUIN")
+            const payMonthName = payMonth.format('MMMM').toUpperCase().substring(0, 4);
+            const payYear = payMonth.year();
+
+            while (currentStart.isBefore(endDate) || currentStart.isSame(endDate, 'day')) {
+                // Début de semaine (pour la 1ère semaine c'est toujours le 26)
+                const weekStart = weekNum === 1 ? startDate.clone() : currentStart.clone();
+                
+                // Fin de semaine - comportement spécial pour la première semaine
+                let weekEnd;
+                if (weekNum === 1) {
+                    // Trouver le prochain dimanche
+                    if (weekStart.day() === 0) { // Si le 26 est déjà un dimanche
+                        weekEnd = weekStart.clone();
+                    } else {
+                        weekEnd = weekStart.clone().day(7); // Prochain dimanche
+                    }
+                } else {
+                    // Pour les autres semaines: 6 jours après le début
+                    weekEnd = weekStart.clone().add(6, 'days');
+                }
+
+                // Ne pas dépasser la date de fin (25)
+                if (weekEnd.isAfter(endDate)) {
+                    weekEnd = endDate.clone();
+                }
+
+                // Générer le nom de la semaine
+                // TOUTES les semaines utilisent le mois de paie (payMonth) pour le nom
+                const weekName = `S${weekNum}_${payMonthName}_${payYear}`;
+
+                generatedWeeks.push({
+                    name: weekName,
+                    start: weekStart.clone(),
+                    end: weekEnd.clone(),
+                    weekNumber: weekNum,
+                    year: payYear
+                });
+
+                currentStart = weekEnd.clone().add(1, 'day');
+                weekNum++;
+            }
+
+            return generatedWeeks;
+        };
+
+        // Requête d'insertion pour la nouvelle structure
+        const insertQuery = `
+            INSERT INTO week_attendance (
+                name, employee_id, start_date, end_date, 
+                total_night_hours, total_worked_hours, total_penalisable, 
+                total_sup, total_missed_hours, total_sunday_hours, 
+                total_jf, total_jc, total_htjf, total_jcx
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10,
+                $11, $12, $13, $14
+            )
+            ON CONFLICT (name, employee_id) DO NOTHING
+        `;
+
+        // Récupérer tous les employés
+        const { rows: employees } = await client.query('SELECT id, attendance_id FROM employees');
+        if (employees.length === 0) {
+            console.log('Aucun employé trouvé.');
+            return;
+        }
+
+        // Déterminer le mois de paie
+        const payMonth = moment().startOf('month');
+        console.log(`🔄 Génération des semaines pour le mois de paie: ${payMonth.format('MMMM YYYY')}`);
+
+        // Générer les semaines une seule fois (elles sont les mêmes pour tous les employés)
+        const weeks = generatePayPeriodWeeks(payMonth);
+        console.log(`📆 ${weeks.length} semaines générées`);
+
+        // Afficher les semaines générées pour vérification
+        console.log("Semaines générées:");
+        weeks.forEach(week => {
+            console.log(`${week.name} - ${week.start.format('YYYY-MM-DD')} au ${week.end.format('YYYY-MM-DD')}`);
+        });
+
+        // Insérer les données pour chaque employé
+        for (const employee of employees) {
+            try {
+                // Utilisation d'une transaction par employé pour plus de sécurité
+                await client.query('BEGIN');
+
+                for (const week of weeks) {
+                    await client.query(insertQuery, [
+                        week.name,
+                        employee.attendance_id,
+                        week.start.format('YYYY-MM-DD'),
+                        week.end.format('YYYY-MM-DD'),
+                        0, // total_night_hours
+                        0, // total_worked_hours
+                        0, // total_penalisable
+                        0, // total_sup
+                        0, // total_missed_hours
+                        0, // total_sunday_hours
+                        0, // total_jf
+                        0, // total_jc
+                        0, // total_htjf
+                        0  // total_jcx
+                    ]);
+                }
+
+                await client.query('COMMIT');
+                console.log(`✓ Semaines créées pour l'employé ${employee.attendance_id}`);
+            } catch (error) {
+                await client.query('ROLLBACK');
+                console.error(`Erreur pour l'employé ${employee.attendance_id}:`, error);
+            }
+        }
+
+        console.log("✅ Données créées avec succès dans week_attendance");
+    } catch (error) {
+        console.error("❌ Erreur lors de la création des données:", error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 
 
 // Fonction pour mettre à jour les week_attendance après mis à jour d'un attendance_summary d'un employé
@@ -2534,7 +2698,7 @@ function initDayData() {
     };
 }
 
-// Fonction pour créer des données sur la table monthly_attendance à partir des données de attendance_summary
+// Fonction pour créer des données sur la table monthly_attendance à partir des données de week_attendance
 async function init_month_attendance(month = moment().startOf('month')) {
     const client = await pool.connect();
     try {
@@ -2653,47 +2817,82 @@ async function update_monthly_attendance() {
         console.log("🔄 Mise à jour des totaux mensuels");
 
         // Requête d'insertion/mise à jour
+
         const query = `
-            INSERT INTO monthly_attendance (
-                employee_id, payroll_id, month_start, month_end,
-                total_night_hours, total_worked_hours, total_penalisable,
-                total_sup, total_sunday_hours, total_missed_hours,
-                total_jf, total_jc, total_jcx, total_htjf
-            )
-            SELECT 
-                e.attendance_id,
-                e.payroll_id,
-                DATE_TRUNC('month', wa.start_date - INTERVAL '5 days')::date AS month_start,
-                (DATE_TRUNC('month', wa.start_date - INTERVAL '5 days') + INTERVAL '1 month' - INTERVAL '1 day')::date AS month_end,
-                SUM(wa.total_night_hours) AS total_night_hours,
-                SUM(wa.total_worked_hours) AS total_worked_hours,
-                SUM(wa.total_penalisable) AS total_penalisable,
-                SUM(wa.total_sup) AS total_sup,
-                SUM(wa.total_sunday_hours) AS total_sunday_hours,
-                SUM(wa.total_missed_hours) AS total_missed_hours,
-                SUM(wa.total_jf) AS total_jf,
-                SUM(wa.total_jc) AS total_jc,
-                SUM(wa.total_jcx) AS total_jcx,
-                SUM(wa.total_htjf) AS total_htjf
-            FROM week_attendance wa
-            JOIN employees e ON wa.employee_id = e.attendance_id
-            GROUP BY e.attendance_id, e.payroll_id, DATE_TRUNC('month', wa.start_date - INTERVAL '5 days')
-            ON CONFLICT (employee_id, month_start) 
-            DO UPDATE SET
-                payroll_id = EXCLUDED.payroll_id,
-                month_end = EXCLUDED.month_end,
-                total_night_hours = EXCLUDED.total_night_hours,
-                total_worked_hours = EXCLUDED.total_worked_hours,
-                total_penalisable = EXCLUDED.total_penalisable,
-                total_sup = EXCLUDED.total_sup,
-                total_sunday_hours = EXCLUDED.total_sunday_hours,
-                total_missed_hours = EXCLUDED.total_missed_hours,
-                total_jf = EXCLUDED.total_jf,
-                total_jc = EXCLUDED.total_jc,
-                total_jcx = EXCLUDED.total_jcx,
-                total_htjf = EXCLUDED.total_htjf,
-                updated_at = NOW()
+        INSERT INTO monthly_attendance (
+            employee_id, payroll_id, month_start, month_end,
+            total_night_hours, total_worked_hours, total_penalisable,
+            total_sup, total_sunday_hours, total_missed_hours,
+            total_jf, total_jc, total_jcx, total_htjf
+        )
+        SELECT 
+            e.attendance_id,
+            e.payroll_id,
+
+            -- month_start : 26 du mois précédent ou courant
+            CASE 
+                WHEN EXTRACT(DAY FROM wa.start_date) >= 26 THEN
+                    DATE_TRUNC('month', wa.start_date) + INTERVAL '25 days'
+                ELSE
+                    DATE_TRUNC('month', wa.start_date - INTERVAL '1 month') + INTERVAL '25 days'
+            END::date AS month_start,
+
+            -- month_end : month_start + 1 mois - 1 jour
+            CASE 
+                WHEN EXTRACT(DAY FROM wa.start_date) >= 26 THEN
+                    DATE_TRUNC('month', wa.start_date) + INTERVAL '1 month + 24 days'
+                ELSE
+                    DATE_TRUNC('month', wa.start_date - INTERVAL '1 month') + INTERVAL '1 month + 24 days'
+            END::date AS month_end,
+
+            -- Totaux
+            COALESCE(SUM(wa.total_night_hours), 0),
+            COALESCE(SUM(wa.total_worked_hours), 0),
+            COALESCE(SUM(wa.total_penalisable), 0),
+            COALESCE(SUM(wa.total_sup), 0),
+            COALESCE(SUM(wa.total_sunday_hours), 0),
+            COALESCE(SUM(wa.total_missed_hours), 0),
+            COALESCE(SUM(wa.total_jf), 0),
+            COALESCE(SUM(wa.total_jc), 0),
+            COALESCE(SUM(wa.total_jcx), 0),
+            COALESCE(SUM(wa.total_htjf), 0)
+
+        FROM week_attendance wa
+        JOIN employees e ON wa.employee_id = e.attendance_id
+
+        GROUP BY 
+            e.attendance_id, e.payroll_id,
+            CASE 
+                WHEN EXTRACT(DAY FROM wa.start_date) >= 26 THEN
+                    DATE_TRUNC('month', wa.start_date) + INTERVAL '25 days'
+                ELSE
+                    DATE_TRUNC('month', wa.start_date - INTERVAL '1 month') + INTERVAL '25 days'
+            END,
+            CASE 
+                WHEN EXTRACT(DAY FROM wa.start_date) >= 26 THEN
+                    DATE_TRUNC('month', wa.start_date) + INTERVAL '1 month + 24 days'
+                ELSE
+                    DATE_TRUNC('month', wa.start_date - INTERVAL '1 month') + INTERVAL '1 month + 24 days'
+            END
+
+        ON CONFLICT (employee_id, month_start) 
+        DO UPDATE SET
+            payroll_id = EXCLUDED.payroll_id,
+            month_end = EXCLUDED.month_end,
+            total_night_hours = EXCLUDED.total_night_hours,
+            total_worked_hours = EXCLUDED.total_worked_hours,
+            total_penalisable = EXCLUDED.total_penalisable,
+            total_sup = EXCLUDED.total_sup,
+            total_sunday_hours = EXCLUDED.total_sunday_hours,
+            total_missed_hours = EXCLUDED.total_missed_hours,
+            total_jf = EXCLUDED.total_jf,
+            total_jc = EXCLUDED.total_jc,
+            total_jcx = EXCLUDED.total_jcx,
+            total_htjf = EXCLUDED.total_htjf,
+            updated_at = NOW()
         `;
+
+
 
         await client.query(query);
         console.log("✅ Totaux mensuels mis à jour avec succès");
@@ -2704,7 +2903,6 @@ async function update_monthly_attendance() {
         client.release();
     }
 }
-
 
 
 const getWeeklyAttendanceByDate = async (req, res) => {
@@ -2747,6 +2945,75 @@ const getWeeklyAttendanceByDate = async (req, res) => {
 };
 
 
+async function prime_assiduite() {
+    const client = await pool.connect();
+
+    try {
+        console.log("🔍 Récupération des employés");
+        
+        // 1. Récupérer tous les employés actifs avec leur plafond
+        const activeEmployees = await client.query(`
+            SELECT plafond, attendance_id FROM employees WHERE is_active = TRUE
+        `);
+
+        if (activeEmployees.rows.length === 0) {
+            console.log("ℹ️ Aucun employé actif trouvé");
+            return;
+        }
+
+        console.log(`👥 ${activeEmployees.rows.length} employés actifs à traiter`);
+
+        for (const emp of activeEmployees.rows) {
+            // 2. Pour chaque employé, récupérer ses heures pénalisables
+            const attendanceData = await client.query(`
+                SELECT prime_assiduite, total_penalisable 
+                FROM monthly_attendance 
+                WHERE employee_id = $1
+            `, [emp.attendance_id]);
+
+            if (attendanceData.rows.length === 0) {
+                console.log(`ℹ️ Aucune donnée de présence trouvée pour l'employé ${emp.attendance_id}`);
+                continue;
+            }
+
+            const { total_penalisable } = attendanceData.rows[0];
+            let new_prime_assiduite = 0;
+
+            // 3. Appliquer la logique de calcul de la prime
+            if (total_penalisable > 18 || emp.plafond == 0) {
+                new_prime_assiduite = 0;
+            } else if (total_penalisable > 9) {
+                new_prime_assiduite = emp.plafond / 4;
+            } else if (total_penalisable > 3) {
+                new_prime_assiduite = emp.plafond / 3;
+            } else if (total_penalisable > 0) {
+                new_prime_assiduite = emp.plafond / 2;
+            } else {
+                // Si total_penalisable = 0, prime = plafond complet
+                new_prime_assiduite = emp.plafond;
+            }
+
+            // 4. Mettre à jour la prime d'assiduité
+            await client.query(`
+                UPDATE monthly_attendance 
+                SET prime_assiduite = $1 
+                WHERE employee_id = $2
+            `, [new_prime_assiduite, emp.attendance_id]);
+
+            console.log(`🔄 Employé ${emp.attendance_id}: prime mise à jour à ${new_prime_assiduite} (heures pénalisables: ${total_penalisable})`);
+        }
+
+        console.log('✅ Traitement terminé pour tous les employés');
+    } catch (error) {
+        console.error('❌ Erreur globale du traitement:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+
+
 module.exports = { 
     downloadAttendance, 
     processAllAttendances, 
@@ -2762,5 +3029,6 @@ module.exports = {
     verifyAndFixPunchSequence,
     processManualAttendance,
     updateAttendanceSummaryFromTimes,
-    apresAjoutIndisponibility
+    apresAjoutIndisponibility,
+    prime_assiduite
 };

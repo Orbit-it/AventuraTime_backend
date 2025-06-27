@@ -29,7 +29,9 @@ exports.loginEmployee = async (req, res) => {
 // Récupérer tous les employés
 exports.getEmployees = async (req, res) => {
   try {
-    const employees = await Employees.findAll();
+    const employees = await Employees.findAll({
+      order: [['payroll_id', 'ASC']]
+    });
     res.json(employees);
   } catch (error) {
     res.status(500).json({ error: error.message });

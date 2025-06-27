@@ -611,6 +611,90 @@ exports.getWeekAttendanceData = async (req, res) => {
   }
 };
 
+exports.getMonthAttendanceData = async (req, res) => {
+  const { start_date, end_date, employee_id } = req.query;
+
+  try {
+    // Construction de la requête de base simplifiée
+    let query = `
+      SELECT 
+        payroll_id,
+        employee_name,
+        employee_id,
+        month_start,
+        month_end,
+        total_night_hours,
+        total_worked_hours,
+        total_penalisable,
+        total_sup,
+        total_missed_hours,
+        total_sunday_hours,
+        total_jf,
+        total_jc,
+        total_htjf,
+        total_jcx,
+        periode_paie,
+        prime_assiduite
+      FROM monthly_attendance
+      WHERE 1=1
+    `;
+
+    const params = [];
+    let paramCount = 1;
+
+    // Filtres
+    if (start_date && end_date) {
+      query += ` AND month_start >= $${paramCount++} AND month_end <= $${paramCount++}`;
+      params.push(start_date, end_date);
+    }
+
+    if (employee_id) {
+      query += ` AND employee_id = $${paramCount++}`;
+      params.push(employee_id);
+    }
+
+    // Tri
+    query += ` ORDER BY month_start DESC`;
+
+
+    // Exécution de la requête
+    const { rows } = await pool.query(query, params);
+
+    // Formatage des résultats simplifié
+    const formattedData = rows.map(row => ({
+      payroll_id: row.payroll_id,
+      employee_name: row.employee_name,
+      employee_id: row.employee_id,
+      month_start: moment(row.month_start).format('DD-MM-YYYY'), 
+      month_end: moment(row.month_end).format('DD-MM-YYYY'),     
+      total_night_hours: row.total_night_hours,
+      total_worked_hours: row.total_worked_hours,
+      total_penalisable: row.total_penalisable,
+      total_sup: row.total_sup,
+      total_missed_hours: row.total_missed_hours,
+      total_sunday_hours: row.total_sunday_hours,
+      total_jf: row.total_jf,
+      total_jc: row.total_jc,
+      total_htjf: row.total_htjf,
+      total_jcx: row.total_jcx,
+      periode_paie: row.periode_paie,
+      prime_assiduite: row.prime_assiduite
+    }));
+
+    // Calcul du total pour la pagination
+
+    res.json(formattedData);
+
+  } catch (error) {
+    console.error('Error in getMonthAttendanceData:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors de la récupération des données',
+      error: error.message
+    });
+  }
+};
+
 
 
 // Récupérer les pointages avec le statut
@@ -1258,15 +1342,21 @@ exports.getMissedbyInterval = async (req, res) => {
 
 exports.getTodayAbsences = async (req, res) => {
   try {
-    // Date d'aujourd'hui
+
     const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    const localDate = `${year}-${month}-${day}`;
+
 
     // 1. Récupérer tous les employés actifs
     const employeeQuery = `
-      SELECT id, name, attendance_id 
+      SELECT id, name, attendance_id, avatar
       FROM employees 
       WHERE is_active = TRUE
+        AND department_id != 10
+        AND attendance_id NOT IN (1, 284)
     `;
     const employeeResult = await pool.query(employeeQuery);
     const activeEmployees = employeeResult.rows;
@@ -1277,76 +1367,80 @@ exports.getTodayAbsences = async (req, res) => {
         success: true,
         message: "Aucun employé actif trouvé",
         data: {
-          date: today.toISOString().split('T')[0],
+          date: localDate,
           total_employees: 0,
           absences: []
         }
       });
     }
 
-    // 2. Récupérer les présences enregistrées aujourd'hui
-    const presentQuery = `
-      SELECT DISTINCT employee_id
-      FROM attendance_summary
+    // 2. Récupérer toutes les entrées d'attendance_summary pour aujourd'hui
+    const attendanceQuery = `
+      SELECT employee_id, status, getin, getout, is_anomalie
+      FROM attendance_summary 
       WHERE date = $1
-      AND (hours_worked IS NOT NULL OR getin_ref IS NOT NULL)
     `;
-    const presentResult = await pool.query(presentQuery, [today]);
-    const presentEmployeeIds = presentResult.rows.map(row => row.employee_id);
+    const attendanceResult = await pool.query(attendanceQuery, [localDate]);
+    const attendanceRecords = attendanceResult.rows;
 
-    // 3. Identifier les absents (actifs non présents)
+    // 3. Créer un map des statuts par employee_id
+    const statusMap = {};
+    attendanceRecords.forEach(record => {
+      statusMap[record.employee_id] = record.status;
+    });
+
+    // 4. Identifier les employés présents (avec pointage valide)
+    const presentEmployeeIds = attendanceRecords
+      .filter(record => record.getin != null || record.getout !=  null)
+      .map(record => record.employee_id);
+
+    // 5. Identifier les absents
     const absentEmployees = activeEmployees.filter(emp => 
-      !presentEmployeeIds.includes(emp.id)
+      !presentEmployeeIds.includes(emp.attendance_id)
     );
 
-    // 4. Récupérer les cas spéciaux (même s'ils ont une entrée)
-    const specialCasesQuery = `
-      SELECT employee_id
-      FROM attendance_summary
-      WHERE date = $1
-      AND getin_ref IS NOT NULL
-      AND hours_worked IS NULL
-      AND isholidays IS NOT TRUE
-      AND islayoff IS NOT TRUE
-      AND has_night_shift IS NOT TRUE
-    `;
-    const specialCasesResult = await pool.query(specialCasesQuery, [today]);
-    const specialCaseIds = specialCasesResult.rows.map(row => row.employee_id);
+    // 6. Préparer les données des absences avec le statut
+    const absencesWithStatus = absentEmployees.map(emp => {
+      const status = statusMap[emp.attendance_id] || 'not_checked';
+      return {
+        ...emp,
+        status: status,
+        absence_type: status === 'not_checked' ? 'no_check' : 'checked_but_no_work',
+        absence_label: status === 'not_checked' 
+          ? 'Aucun pointage' 
+          : `Pointé - Statut: ${status}`
+      };
+    });
 
-    // 5. Combiner les listes (absents + cas spéciaux)
-    const allAbsentEmployees = [
-      ...absentEmployees.map(emp => ({...emp, absence_type: 'no_check'})),
-      ...activeEmployees
-        .filter(emp => specialCaseIds.includes(emp.id))
-        .map(emp => ({...emp, absence_type: 'checked_but_no_work'}))
-    ];
-
-    // 6. Calculer les statistiques
-    const totalAbsence = allAbsentEmployees.length;
+    // 7. Calculer les statistiques
+    const totalAbsence = absencesWithStatus.length;
     const tauxAbsence = (totalAbsence / activeEmployeeCount * 100).toFixed(2);
     const tauxPresence = (100 - tauxAbsence).toFixed(2);
 
-    // 7. Préparer la réponse
+    // 8. Préparer la réponse
     const response = {
-      date: today.toISOString().split('T')[0],
+      date: localDate,
       total_employees: activeEmployeeCount,
       present_employees: activeEmployeeCount - totalAbsence,
       absent_employees: totalAbsence,
       absence_rate: parseFloat(tauxAbsence),
       presence_rate: parseFloat(tauxPresence),
-      absences: allAbsentEmployees.map(emp => ({
-        employee_id: emp.id,
+      absences: absencesWithStatus.map(emp => ({
+        employee_id: emp.attendance_id,
         name: emp.name,
-        attendance_id: emp.attendance_id,
+        avatar: emp.avatar,
+        status: emp.status,
         absence_type: emp.absence_type,
-        absence_label: emp.absence_type === 'no_check' 
-          ? 'Aucun pointage' 
-          : 'Pointé mais pas de temps travaillé'
+        absence_label: emp.absence_label
       })),
       summary: {
+        by_status: absencesWithStatus.reduce((acc, emp) => {
+          acc[emp.status] = (acc[emp.status] || 0) + 1;
+          return acc;
+        }, {}),
         by_type: {
-          no_check: absentEmployees.length,
-          checked_but_no_work: specialCaseIds.length
+          no_check: absencesWithStatus.filter(e => e.absence_type === 'no_check').length,
+          checked_but_no_work: absencesWithStatus.filter(e => e.absence_type === 'checked_but_no_work').length
         }
       }
     };
