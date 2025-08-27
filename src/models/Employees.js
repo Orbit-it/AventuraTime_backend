@@ -19,6 +19,7 @@ const Employees = db.define(
       phone_number: { type: DataTypes.STRING, allowNull: true },
       is_active: { type: DataTypes.BOOLEAN, defaultValue: true },
       department_id: { type: DataTypes.INTEGER, allowNull: true },
+      birthday_date: { type: DataTypes.DATE, allowNull: true },
       hire_date: { type: DataTypes.DATE, allowNull: true },
       termination_date: { type: DataTypes.DATE, allowNull: true },
     },

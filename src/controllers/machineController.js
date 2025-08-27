@@ -61,11 +61,57 @@ exports.downloadAttendance = async (req, res) => {
     const data = await machineService.downloadAttendance(machine);
     res.json(data);
 
-    await machineService.classifyAllPunchesWithLogs(); // Classifie les pointages après chaque Téléchargement de pointage
-
-    await machineService.processMonthlyAttendance();  // Calcule et Met à jour les pointages
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
+
+
+// Backend: Single endpoint implementation
+exports.computeAttendance = async (req, res) => {
+  try {
+    const { machines, failedMachines } = req.body;
+
+    // Configuration de l'en-tête une seule fois
+    res.setHeader('Content-Type', 'application/json');
+    
+    // Fonction helper pour envoyer des mises à jour de progression
+    const sendProgressUpdate = (progress, message) => {
+      res.write(JSON.stringify({ progress, message }) + '\n');
+    };
+
+    // Étape 1: Classification des pointages
+    sendProgressUpdate(40, "Classification des pointages...");
+    await machineService.classifyAllPunchesWithLogs();
+
+    // Étape 2: Traitement des présences mensuelles
+    sendProgressUpdate(70, "Calcul des présences mensuelles...");
+    await machineService.processMonthlyAttendance();
+
+    // Réponse finale
+    sendProgressUpdate(100, 
+      `✅ Traitement terminé pour tous les employés\n` +
+      `✅ Traitement des résumés d'attendance terminé\n` +
+      `${failedMachines.length > 0 ? `⚠ ${failedMachines.length} machines en échec` : '✔ Tous les pointages traités'}`);
+
+    // Fermer la réponse
+    res.end();
+
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: `Erreur de traitement: ${error.message}`
+      });
+    } else {
+      console.error("Erreur après envoi des en-têtes:", error);
+      // Envoyer un message d'erreur comme dernière chunk si possible
+      res.write(JSON.stringify({ 
+        error: true,
+        message: `Erreur finale: ${error.message}`
+      }) + '\n');
+      res.end();
+    }
+  }
+};
+

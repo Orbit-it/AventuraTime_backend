@@ -511,6 +511,7 @@ exports.getWeekAttendanceData = async (req, res) => {
         total_jf,
         total_jc,
         total_htjf,
+        total_normal_trav,
         total_jcx
       FROM week_attendance
       WHERE 1=1
@@ -570,7 +571,9 @@ exports.getWeekAttendanceData = async (req, res) => {
       total_jf: row.total_jf,
       total_jc: row.total_jc,
       total_htjf: row.total_htjf,
+      total_normal_trav: row.total_normal_trav,
       total_jcx: row.total_jcx
+      
     }));
 
     // Calcul du total pour la pagination
@@ -632,6 +635,7 @@ exports.getMonthAttendanceData = async (req, res) => {
         total_jf,
         total_jc,
         total_htjf,
+        total_normal_trav,
         total_jcx,
         periode_paie,
         prime_assiduite
@@ -669,6 +673,7 @@ exports.getMonthAttendanceData = async (req, res) => {
       month_end: moment(row.month_end).format('DD-MM-YYYY'),     
       total_night_hours: row.total_night_hours,
       total_worked_hours: row.total_worked_hours,
+      total_normal_trav: row.total_normal_trav,
       total_penalisable: row.total_penalisable,
       total_sup: row.total_sup,
       total_missed_hours: row.total_missed_hours,
@@ -694,8 +699,6 @@ exports.getMonthAttendanceData = async (req, res) => {
     });
   }
 };
-
-
 
 // Récupérer les pointages avec le statut
 
@@ -752,6 +755,7 @@ exports.getAttendanceSummary = async (req, res) => {
               normal_hours,
               missed_hour, 
               penalisable, 
+              hrs_norm_trav,
               is_weekend,
               is_conge,
               islayoff,

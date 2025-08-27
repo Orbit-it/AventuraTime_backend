@@ -38,6 +38,21 @@ exports.getEmployees = async (req, res) => {
   }
 };
 
+// Récupérer tous les employés actifs
+exports.getActiveEmployees = async (req, res) => {
+  try {
+    const activeEmployees = await Employees.findAll({
+      where: {
+        is_active: true
+      },
+      order: [['payroll_id', 'ASC']]
+    });
+    res.json(activeEmployees);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 // Récupérer les emloyés par departement
 exports.getEmployeesByDepartment = async (req, res) => {
   try {

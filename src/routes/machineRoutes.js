@@ -1,5 +1,5 @@
 const express = require('express');
-const { addMachine, getMachines, deleteMachine, updateMachine, downloadAttendance } = require('../controllers/machineController');
+const { addMachine, getMachines, deleteMachine, updateMachine, downloadAttendance, computeAttendance } = require('../controllers/machineController');
 
 const router = express.Router();
 
@@ -8,5 +8,6 @@ router.get('/machines', getMachines); // Liste des machines
 router.delete('/machines/:id', deleteMachine); // Supprimer une machine
 router.put('/machines/:id', updateMachine); // Mettre à jour une machine
 router.post('/machines/:id/attendance', downloadAttendance); // Télécharger les données de présence
+router.post('/machines/compute', computeAttendance); // Télécharger les données de présence
 
 module.exports = router;

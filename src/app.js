@@ -9,6 +9,7 @@ const machineRoutes = require('./routes/machineRoutes');
 const attendanceRoutes = require('./routes/attendanceRoutes');
 const shiftRoutes = require('./routes/shiftRoutes');
 const layoffRoutes = require('./routes/layoffRoutes');
+const toolLooseRoutes = require('./routes/toolLooseRoutes')
 const holidayRoutes = require('./routes/holidayRoutes'); // Routes pour les jours fériés
 const authMiddleware = require('./middlewares/authMiddleware'); // Middleware d'authentification
 const multer = require('multer');
@@ -74,6 +75,7 @@ app.use('/api', machineRoutes);
 app.use('/api', attendanceRoutes);
 app.use('/api', shiftRoutes);
 app.use('/api', layoffRoutes);
+app.use('/api', toolLooseRoutes);
 app.use('/api', holidayRoutes); 
 
 

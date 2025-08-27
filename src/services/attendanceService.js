@@ -62,7 +62,7 @@ async function flagAsProcessingError(employeeId) {
     );
 }
 
-// Fonction pour classer automatiquement tous les pointages
+/* Fonction pour classer automatiquement tous les pointages
 async function classifyAllPunchesWithLogs() {
     console.log('[Début] Reclassification de tous les pointages');
 
@@ -194,9 +194,161 @@ async function classifyAllPunchesWithLogs() {
         console.error('[ERREUR GLOBALE]', error.stack);
         throw error;
     }
+}  */
+
+async function classifyAllPunchesWithLogs() {
+    console.log('[Début] Reclassification de tous les pointages');
+
+    try {
+        // 1. Récupérer tous les pointages (même ceux avec punch_type déjà défini)
+        console.time('Récupération des données');
+        const punches = await pool.query(`
+            SELECT id, employee_id, punch_time, punch_type
+            FROM attendance_records
+            ORDER BY employee_id, punch_time
+        `);
+        console.timeEnd('Récupération des données');
+        console.log(`→ ${punches.rows.length} pointages récupérés`);
+
+        if (punches.rows.length === 0) {
+            console.log('[Fin] Aucun pointage à classifier');
+            return;
+        }
+
+        // 2. Grouper les pointages par employé et par jour
+        const employeesPunches = {};
+        punches.rows.forEach(punch => {
+            if (!employeesPunches[punch.employee_id]) {
+                employeesPunches[punch.employee_id] = {};
+            }
+
+            const punchDate = new Date(punch.punch_time);
+            const dayKey = `${punchDate.getFullYear()}-${punchDate.getMonth() + 1}-${punchDate.getDate()}`;
+
+            if (!employeesPunches[punch.employee_id][dayKey]) {
+                employeesPunches[punch.employee_id][dayKey] = [];
+            }
+
+            employeesPunches[punch.employee_id][dayKey].push(punch);
+        });
+
+        const employeeIds = Object.keys(employeesPunches);
+        console.log(`→ ${employeeIds.length} employés concernés`);
+
+        // 3. Traitement par employé/jour
+        for (const employeeId of employeeIds) {
+            const daysPunches = employeesPunches[employeeId];
+            const dayKeys = Object.keys(daysPunches).sort();
+
+            console.log(`\n=== Employé ${employeeId} (${dayKeys.length} jours) ===`);
+
+            for (let d = 0; d < dayKeys.length; d++) {
+                const dayKey = dayKeys[d];
+                const punchesOfDay = daysPunches[dayKey];
+                punchesOfDay.sort((a, b) => new Date(a.punch_time) - new Date(b.punch_time));
+
+                console.log(`\n--- ${dayKey} (${punchesOfDay.length} pointages) ---`);
+
+                let lastPunchType = null;
+                let isNightShift = false;
+                let previousDayHadNightEntry = false;
+
+                // Vérifier s'il y a eu une entrée la veille entre 21h et 23h
+                if (d > 0) {
+                    const previousDayKey = dayKeys[d - 1];
+                    const previousDayPunches = daysPunches[previousDayKey];
+                    previousDayHadNightEntry = previousDayPunches.some(punch => {
+                        const punchTime = new Date(punch.punch_time);
+                        const hours = punchTime.getHours();
+                        return punch.punch_type === 'IN' && hours >= 21 && hours < 23;
+                    });
+                    console.log(`→ Entrée entre 21h-23h la veille: ${previousDayHadNightEntry ? 'OUI' : 'NON'}`);
+                }
+
+                for (let i = 0; i < punchesOfDay.length; i++) {
+                    const punch = punchesOfDay[i];
+                    const punchTime = new Date(punch.punch_time);
+                    const hours = punchTime.getHours();
+                    const minutes = punchTime.getMinutes();
+                    const timeStr = punchTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+                    try {
+                        console.log(`Pointage #${i + 1} à ${timeStr}`);
+
+                        const isNightTime = hours >= 21 || hours < 6;
+                        const isEarlyMorning = (hours === 5 && minutes > 10) || (hours === 6 && minutes <= 50);
+
+                        // Premier pointage
+                        if (i === 0) {
+                            if (isEarlyMorning) {
+                                // Si pas d'entrée la veille entre 21h-23h, c'est une entrée matinale
+                                if (!previousDayHadNightEntry) {
+                                    punch.punch_type = 'IN';
+                                    isNightShift = false;
+                                    console.log('→ Premier pointage matinal = IN (pas d\'entrée la veille 21h-23h)');
+                                } else {
+                                    punch.punch_type = 'OUT';
+                                    isNightShift = false;
+                                    console.log('→ Premier pointage matinal = OUT (fin de nuit)');
+                                }
+                            } else {
+                                punch.punch_type = 'IN';
+                                isNightShift = isNightTime;
+                                console.log(isNightTime ? '→ Début: shift de nuit' : '→ Début: shift de jour');
+                            }
+                        }
+                        // Pointages suivants
+                        else {
+                            const prevPunchTime = new Date(punchesOfDay[i - 1].punch_time);
+                            const timeDiff = (punchTime - prevPunchTime) / (1000 * 60); // minutes
+
+                            if (isEarlyMorning && isNightShift) {
+                                punch.punch_type = 'OUT';
+                                isNightShift = false;
+                                console.log('→ OUT automatique (fin de nuit)');
+                            } else if (hours >= 21 && !isNightShift && timeDiff > 60) {
+                                punch.punch_type = 'IN';
+                                isNightShift = true;
+                                console.log('→ Début nouveau shift de nuit');
+                            } else {
+                                punch.punch_type = lastPunchType === 'IN' ? 'OUT' : 'IN';
+                                console.log(`→ Alternance normale (dernier type: ${lastPunchType})`);
+                            }
+                        }
+
+                        lastPunchType = punch.punch_type;
+
+                        // Forcer la mise à jour même si punch_type était déjà défini
+                        await pool.query(
+                            `UPDATE attendance_records 
+                             SET punch_type = $1, 
+                                 needs_review = false 
+                             WHERE id = $2`,
+                            [punch.punch_type, punch.id]
+                        );
+
+                        console.log(`✓ punch_type mis à jour en ${punch.punch_type}`);
+
+                    } catch (err) {
+                        console.error(`❌ Erreur sur pointage ${punch.id}:`, err.message);
+                        await pool.query(
+                            `UPDATE attendance_records 
+                             SET needs_review = true,
+                                 review_reason = $1
+                             WHERE id = $2`,
+                            [`Erreur traitement: ${err.message.slice(0, 100)}`, punch.id]
+                        );
+                    }
+                }
+            }
+        }
+
+        console.log('\n[Fin] Reclassification terminée');
+    } catch (error) {
+        console.error('[ERREUR GLOBALE]', error.stack);
+        throw error;
+    }
 }
-
-
 
 
 // Fonction pour vérifier la classification des pointages et de detecter les pointages manquant afin de creer une notification pour informer le service rh
@@ -642,7 +794,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
         const layoffQuery = `
             SELECT start_date, end_date, type
             FROM layoff
-            WHERE start_date <= $1 AND end_date >= $1 AND is_purged = FALSE AND employee_id = $2
+            WHERE start_date <= $1 AND end_date >= $1 AND is_purged = FALSE AND (type <> 'blame' AND type <> 'avertissement') AND employee_id = $2
         `;
         const layoffResult = await client.query(layoffQuery, [date, employee_innerID]);
 
@@ -804,23 +956,52 @@ async function processNightShifts(employeeId) {
     try {
         console.log(`🌙 Traitement des shifts de nuit pour l'employé ${employeeId}`);
 
-        // Récupération des paires IN/OUT optimisée
+        // Récupération des paires IN/OUT optimisée pour les shifts de nuit
         const nightShiftsQuery = `
-            WITH ordered_punches AS (
-                SELECT id, employee_id, punch_time, punch_type,
-                       LAG(id) OVER (PARTITION BY employee_id ORDER BY punch_time) AS in_id,
-                       LAG(punch_time) OVER (PARTITION BY employee_id ORDER BY punch_time) AS in_time
+            WITH punches AS (
+                SELECT 
+                    id, 
+                    employee_id, 
+                    punch_time, 
+                    punch_type,
+                    DATE(punch_time) AS punch_date,
+                    EXTRACT(HOUR FROM punch_time) + EXTRACT(MINUTE FROM punch_time) / 60 AS punch_hour
                 FROM attendance_records
                 WHERE employee_id = $1
+                ORDER BY punch_time
+            ),
+            night_pairs AS (
+                SELECT 
+                    p1.id AS in_id,
+                    p2.id AS out_id,
+                    p1.punch_time AS in_time,
+                    p2.punch_time AS out_time,
+                    DATE(p1.punch_time) AS shift_date,
+                    (EXTRACT(EPOCH FROM (p2.punch_time - p1.punch_time)) / 3600) AS night_hours
+                FROM punches p1
+                JOIN punches p2 ON p2.id = (
+                    SELECT MIN(p3.id)
+                    FROM punches p3
+                    WHERE p3.punch_time > p1.punch_time
+                    AND p3.punch_type = 'OUT'
+                )
+                WHERE p1.punch_type = 'IN'
+                AND p1.punch_hour >= 21.5 AND p1.punch_hour < 24
+                AND p2.punch_hour >= 5 AND p2.punch_hour <= 7
             )
-            SELECT in_id, id AS out_id, in_time, punch_time AS out_time,
-                   DATE(in_time) AS shift_date,
-                   LEAST(EXTRACT(EPOCH FROM (punch_time - in_time)) / 3600, 8) AS night_hours
-            FROM ordered_punches
-            WHERE punch_type = 'OUT' AND in_time IS NOT NULL
-              AND (EXTRACT(HOUR FROM in_time) >= 21 OR EXTRACT(HOUR FROM punch_time) < 6)
+            SELECT 
+                in_id,
+                out_id,
+                in_time,
+                out_time,
+                shift_date,
+                night_hours
+            FROM night_pairs
+            WHERE night_hours > 0
             ORDER BY shift_date;
         `;
+
+
 
         const nightShifts = await client.query(nightShiftsQuery, [employeeId]);
         console.log(`🔍 ${nightShifts.rows.length} shifts de nuit trouvés`);
@@ -870,10 +1051,10 @@ async function processNightShifts(employeeId) {
     }
 }
 
-// Fonction pour traiter les shifts reguliers OK
-async function processRegularShifts(employeeId, date) {
+// Fonction pour traiter les pointage pour la date d'aujourd'hui OK
+async function forToday(employeeId, date) {
     // Constants for business rules
-    const REGULAR_SHIFT_START_MINUTES = 6 * 60 + 16; // 6:16 AM (06:16)
+    const REGULAR_SHIFT_START_MINUTES = 1 * 60 ; // 1:00 AM (01:00)
     const REGULAR_SHIFT_END_MINUTES = 20 * 60 + 59;   // 8:59 PM (20:59)
     const MIN_WORK_HOURS = 0; // Minimum worked hours can't be negative
     const HOURS_PRECISION = 2; // Decimal places for hours calculations
@@ -891,8 +1072,8 @@ async function processRegularShifts(employeeId, date) {
      const targetDate = new Date(date);
      const startDate = new Date(targetDate);
      const endDate = new Date(targetDate);
-     startDate.setDate(targetDate.getDate() - 1);
-     endDate.setDate(targetDate.getDate() + 1);
+     startDate.setDate(targetDate.getDate());
+     endDate.setDate(targetDate.getDate());
 
 
     if (!Number.isInteger(Number(employeeId))) {
@@ -1017,8 +1198,7 @@ async function processRegularShifts(employeeId, date) {
                 let workedHours = parseFloat(shift.raw_worked_hours) || 0;
 
                 const is_today = isToday(new Date(shift.shift_date));
-                const is_anomalie = !is_today && (getin == null || getout == null);
-                  
+            
 
                 // 3. Get shift summary data
                 const summaryQuery = `
@@ -1099,8 +1279,7 @@ async function processRegularShifts(employeeId, date) {
                         getout = $4::TIME,
                         autoriz_getin = $5::TIME,
                         autoriz_getout = $6::TIME,
-                        is_anomalie = $8,
-                        is_today = $9,
+                        is_today = $8,
                         nbr_absence = 0,
                         status = CASE
                             WHEN ($7::NUMERIC = 0 ) AND is_anomalie = FALSE THEN 'absent'
@@ -1116,11 +1295,7 @@ async function processRegularShifts(employeeId, date) {
                         nbr_retard = CASE
                             WHEN $3::TIME <= getin_ref THEN 0
                             WHEN $3::TIME > getin_ref THEN 1
-                        END,  
-                        nbr_depanti = CASE
-                            WHEN $4::TIME < getout_ref THEN 1
-                            ELSE 0
-                        END,    
+                        END,      
                         hours_worked = CASE
                             WHEN is_sunday THEN 0
                             ELSE $7::NUMERIC
@@ -1152,8 +1327,7 @@ async function processRegularShifts(employeeId, date) {
                     autoriz_getin || null, //$5
                     autoriz_getout || null, //$6
                     workedHours || 0,   //$7
-                    is_anomalie,   //$8
-                    is_today  //$9
+                    is_today  //$8
                 ]);
                 
 
@@ -1164,14 +1338,14 @@ async function processRegularShifts(employeeId, date) {
             }
         }
 
-        console.log(`✅ Completed processing for employee ${employeeId}`);
+        console.log(`✅ Completed processing pour l'employé ${employeeId} à la date d'aujourd'hui`);
     } catch (error) {
         console.error(`❌ Critical error processing employee ${employeeId}:`, error.message);
         throw error;
     } finally {
         client.release();
     }
-}
+}  
 
 // Fonction pour mettre à jour les valeurs d'absences en cas d'heure travaillée non pénalisable
 async function processMissedHours(employeeId, date) {
@@ -1221,6 +1395,277 @@ async function processMissedHours(employeeId, date) {
         console.error(`❌ Erreur de mise à jour des heures manquées pour l'employé ${employeeId}:`, err.message);
     } finally {
         client.release();
+    }
+}
+
+// Fonction pour traiter les pointages sauf ceux d'aujour'hui OK
+async function processRegularShifts(employeeId, date) {
+    // Constants for business rules
+    const REGULAR_SHIFT_START_MINUTES = 4 * 60; // 4:00 AM (04:00)
+    const REGULAR_SHIFT_END_MINUTES = 21 * 60; // 9:00 PM (21:00)
+    const MIN_WORK_HOURS = 0;
+    const HOURS_PRECISION = 2;
+
+    // Date calculations
+    const targetDate = new Date(date);
+    const startDate = new Date(targetDate);
+    const endDate = new Date(targetDate);
+    startDate.setDate(targetDate.getDate() - 2);
+    endDate.setDate(targetDate.getDate() - 1);
+
+    if (!Number.isInteger(Number(employeeId))) {
+        throw new Error(`Invalid employee ID: ${employeeId}`);
+    }
+
+    const client = await pool.connect();
+    try {
+        console.log(`🌞 Calcul de pointage de employee de Matricule: ${employeeId} à une antérieure`);
+
+        // 1. Fetch all regular shifts
+        const regularShiftsQuery = `
+        WITH ordered_punches AS (
+            SELECT 
+                id, 
+                employee_id, 
+                punch_time, 
+                punch_type,
+                DATE(punch_time) AS punch_date,
+                EXTRACT(HOUR FROM punch_time) * 60 + EXTRACT(MINUTE FROM punch_time) AS minutes_in_day
+            FROM attendance_records
+            WHERE employee_id = $1
+              AND DATE(punch_time) BETWEEN $4::date AND $5::date
+              AND (EXTRACT(HOUR FROM punch_time) * 60 + EXTRACT(MINUTE FROM punch_time) 
+                   BETWEEN $2 AND $3)
+        )
+        SELECT 
+            punch_time,
+            punch_type,
+            punch_date
+        FROM ordered_punches
+        ORDER BY punch_time
+        `;
+
+        const shifts = await client.query(regularShiftsQuery, [
+            employeeId,
+            REGULAR_SHIFT_START_MINUTES,
+            REGULAR_SHIFT_END_MINUTES,
+            startDate,
+            endDate
+        ]);
+
+        // Group shifts by date
+        const shiftsByDate = {};
+        shifts.rows.forEach(shift => {
+            const dateKey = shift.punch_date.toISOString().split('T')[0];
+            if (!shiftsByDate[dateKey]) {
+                shiftsByDate[dateKey] = [];
+            }
+            shiftsByDate[dateKey].push(shift);
+        });
+
+        // Process each day
+        for (const [dateKey, dayShifts] of Object.entries(shiftsByDate)) {
+            try {
+                // Get all punches for the day
+                const allPunchesQuery = `
+                    SELECT 
+                        punch_time,
+                        punch_type
+                    FROM attendance_records
+                    WHERE employee_id = $1
+                      AND DATE(punch_time) = $2
+                    ORDER BY punch_time;
+                `;
+                const allPunches = await client.query(allPunchesQuery, [employeeId, dateKey]);
+
+                // Initialize variables
+                let getin = null;
+                let getout = null;
+                let autoriz_getin = null;
+                let autoriz_getout = null;
+                let workedHours = 0;
+
+                
+
+                // Process punches
+                if (allPunches.rows.length >= 2) {
+                    // First IN is getin
+                    const firstIn = allPunches.rows.find(p => p.punch_type === 'IN');
+                    if (firstIn) getin = formatTime(firstIn.punch_time);
+
+                    // Last OUT is getout
+                    const lastOut = [...allPunches.rows].reverse().find(p => p.punch_type === 'OUT');
+                    if (lastOut) getout = formatTime(lastOut.punch_time);
+
+                    // Special case: exactly 4 punches
+                    if (allPunches.rows.length === 4 && 
+                        allPunches.rows[0].punch_type === 'IN' &&
+                        allPunches.rows[1].punch_type === 'OUT' &&
+                        allPunches.rows[2].punch_type === 'IN' &&
+                        allPunches.rows[3].punch_type === 'OUT') {
+                        
+                        autoriz_getout = formatTime(allPunches.rows[1].punch_time);
+                        autoriz_getin = formatTime(allPunches.rows[2].punch_time);
+                    }
+                    // General case: multiple punches
+                    else if (allPunches.rows.length > 2) {
+                        const inIndexes = allPunches.rows
+                            .map((p, i) => p.punch_type === 'IN' ? i : -1)
+                            .filter(i => i !== -1);
+                        
+                        const outIndexes = allPunches.rows
+                            .map((p, i) => p.punch_type === 'OUT' ? i : -1)
+                            .filter(i => i !== -1);
+
+                        if (inIndexes.length > 0 && outIndexes.length > 0) {
+                            // First OUT after first IN is autoriz_getout
+                            const firstOutAfterFirstIn = outIndexes.find(oi => oi > inIndexes[0]);
+                            if (firstOutAfterFirstIn !== undefined) {
+                                autoriz_getout = formatTime(allPunches.rows[firstOutAfterFirstIn].punch_time);
+                            }
+
+                            // Last IN before last OUT is autoriz_getin
+                            const lastInBeforeLastOut = [...inIndexes]
+                                .reverse()
+                                .find(ii => ii < outIndexes[outIndexes.length - 1]);
+                            if (lastInBeforeLastOut !== undefined) {
+                                autoriz_getin = formatTime(allPunches.rows[lastInBeforeLastOut].punch_time);
+                            }
+                        }
+                    }
+
+                    // Calculate worked hours
+                    if (getin && getout) {
+                        workedHours = (new Date(`1970-01-01T${getout}:00`) - 
+                                     new Date(`1970-01-01T${getin}:00`)) / 3600000;
+
+                        // Subtract authorization period if exists
+                        if (autoriz_getin && autoriz_getout) {
+                            const authDuration = (new Date(`1970-01-01T${autoriz_getin}:00`) - 
+                                              new Date(`1970-01-01T${autoriz_getout}:00`)) / 3600000;
+                            workedHours = Math.max(workedHours - authDuration, MIN_WORK_HOURS);
+                        }
+                    }
+                }
+
+                // Get shift summary data
+                const summaryQuery = `
+                    SELECT 
+                        getin_ref, 
+                        getout_ref,
+                        break_duration
+                    FROM attendance_summary
+                    WHERE employee_id = $1 
+                      AND date = $2
+                      AND isholidays = FALSE 
+                      AND is_conge = FALSE 
+                      AND islayoff = FALSE
+                    LIMIT 1;
+                `;
+                const summaryResult = await client.query(summaryQuery, [employeeId, dateKey]);
+                
+                if (summaryResult.rows.length === 0) continue;
+                
+                const summary = summaryResult.rows[0];
+                const getin_ref = formatTime(summary.getin_ref);
+                const getout_ref = formatTime(summary.getout_ref);
+                const breakDuration = parseFloat(summary.break_duration) || 0;
+
+                // Subtract break   
+                workedHours = parseFloat(
+                    Math.max(workedHours - breakDuration, MIN_WORK_HOURS).toFixed(HOURS_PRECISION)
+                );
+                const is_missing = (getin == null && getout == null)
+                
+                // Vérifie si le nombre de pointages est impair (indiquant une anomalie)
+                const is_anomalie = allPunches.rows.length % 2 !== 0;
+
+
+                // Update attendance summary
+                await client.query(`
+                    UPDATE attendance_summary
+                    SET 
+                        getin = $3::TIME,
+                        getout = $4::TIME,
+                        autoriz_getin = $5::TIME,
+                        autoriz_getout = $6::TIME,
+                        is_anomalie = $8,
+                        hours_worked = CASE
+                            WHEN is_sunday THEN 0
+                            ELSE $7::NUMERIC
+                        END,
+                        status = CASE
+                            WHEN ($7::NUMERIC = 0) AND is_anomalie = FALSE  THEN 'absent'
+                            WHEN getin_ref IS NULL THEN 'present'
+                            WHEN $3::TIME <= getin_ref THEN 'present'
+                            ELSE 'retard'
+                        END,
+                        get_holiday = CASE
+                            WHEN $3 IS NULL THEN FALSE
+                            WHEN getin_ref IS NULL THEN TRUE
+                            ELSE TRUE
+                        END,
+                        nbr_retard = CASE
+                            WHEN $3::TIME <= getin_ref THEN 0
+                            WHEN $3::TIME > getin_ref THEN 1
+                        END,  
+                        nbr_absence = CASE
+                            WHEN $9 IS TRUE THEN 1
+                            ELSE 0
+                        END, 
+                        nbr_depanti = CASE
+                            WHEN $4::TIME < getout_ref THEN 1
+                            ELSE 0
+                        END,
+                        sunday_hour = CASE
+                        WHEN is_sunday = TRUE THEN $7::NUMERIC
+                        ELSE 0
+                        END,
+                        sup_hour = CASE
+                        WHEN is_saturday = TRUE AND getin_ref is NULL THEN $7::NUMERIC
+                        ELSE GREATEST($7::NUMERIC - normal_hours::NUMERIC, 0 )
+                        END,
+                        missed_hour = GREATEST(COALESCE(normal_hours::NUMERIC, 0) - COALESCE(hours_worked::NUMERIC, 0), 0 ),
+                        penalisable = GREATEST(COALESCE(normal_hours::NUMERIC, 0) - COALESCE(hours_worked::NUMERIC, 0), 0 ),
+                        updated_at = NOW()
+                    WHERE employee_id = $1 AND date = $2
+                    AND isholidays IS NOT TRUE 
+                    AND is_conge IS NOT TRUE 
+                    AND islayoff IS NOT TRUE  
+                    AND is_congex IS NOT TRUE  
+                    AND do_not_touch IS NOT TRUE
+                    AND is_maladie IS NOT TRUE  
+                    AND is_accident IS NOT TRUE ;
+                `, [
+                    employeeId,     //$1
+                    dateKey,        //$2
+                    getin,          //$3
+                    getout,         //$4
+                    autoriz_getin,  //$5
+                    autoriz_getout, //$6
+                    workedHours,    //$7
+                    is_anomalie,    //$8
+                    is_missing       //$9
+                ]);
+
+            } catch (dayError) {
+                console.error(`❌ Error processing day ${dateKey}:`, dayError.message);
+                continue;
+            }
+        }
+
+        console.log(`✅ Completed processing for employee ${employeeId}`);
+    } catch (error) {
+        console.error(`❌ Critical error processing employee ${employeeId}:`, error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+
+    function formatTime(dateTime) {
+        if (!dateTime || isNaN(new Date(dateTime).getTime())) return null;
+        const d = new Date(dateTime);
+        return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     }
 }
 
@@ -1464,6 +1909,121 @@ async function deleteUnusedAttendanceSummary(employeeId = null) {
     }
 }
 
+// Fonction pour eliminer les attendance_summary weekend après ajout d'indisponibilité
+async function deleteAttendanceSummary(employeeId = null, start_date, end_date) {
+    const client = await pool.connect();
+    
+    try {
+        console.log('Nettoyage des summaries weekend sans getin_ref');
+        
+        // Construction plus sécurisée avec pg-format ou template literals
+        const conditions = [
+            'getin_ref IS NULL',
+            'is_weekend = TRUE',
+            `date BETWEEN '${start_date}' AND '${end_date}'`
+        ];
+        
+        if (employeeId) {
+            conditions.push(`employee_id = ${employeeId}`);
+        }
+        
+        const whereClause = conditions.join(' AND ');
+        const query = `DELETE FROM attendance_summary WHERE ${whereClause}`;
+        
+        console.log('Executing query:', query);
+        
+        const result = await client.query(query);
+        
+        console.log(`✅ ${result.rowCount} enregistrement(s) supprimé(s) avec succès !`);
+        return result.rowCount;
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la suppression:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Fonction pour eliminer les attendance_summary  sans travail ou sans pointages
+async function cleanAttendanceSummary(employeeId) {
+    const client = await pool.connect();
+    
+    try {
+        console.log('Nettoyage des attendance_summary non pertinents');
+        
+        // Construction de la requête dynamique
+        let query = `
+            DELETE FROM attendance_summary
+            WHERE 
+                (hours_worked IS NULL OR hours_worked = 0) AND
+                (sup_hour IS NULL OR sup_hour = 0) AND
+                (night_hours IS NULL OR night_hours = 0) AND
+                (sunday_hour IS NULL OR sunday_hour = 0) AND
+                isholidays = FALSE AND 
+                is_conge = FALSE AND 
+                islayoff = FALSE AND
+                is_congex = FALSE AND
+                is_maladie = FALSE AND 
+                is_accident = FALSE AND
+                is_anomalie = FALSE AND
+                is_today = FALSE
+        `;
+        
+        // Ajout du filtre par employé si spécifié
+        const params = [];
+        if (employeeId) {
+            query += ` AND employee_id = $1`;
+            params.push(employeeId);
+        }
+        
+        // Exécution de la suppression
+        const result = await client.query(query, params);
+        
+        console.log(`✅ ${result.rowCount} enregistrement(s) supprimé(s) avec succès !`);
+        return result.rowCount;
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la suppression:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Fonction pour eliminer les attendance_summary weekend sans travail ou sans pointages
+async function deletAttendanceSummary(employeeId, date) {
+    const client = await pool.connect();
+    
+    try {
+        console.log('Nettoyage des attendance_summary ');
+        
+        // Construction de la requête dynamique
+        let query = `
+            DELETE FROM attendance_summary
+            WHERE 
+                do_not_touch IS NOT TRUE
+                AND date = $1
+                AND employee_id = $2
+        `;
+        
+        // Ajout du filtre par employé si spécifié
+        const params = [date, employeeId];
+        
+        // Exécution de la suppression
+        const result = await client.query(query, params);
+        
+        console.log(`✅ ${result.rowCount} enregistrement(s) supprimé(s) avec succès !`);
+        return result.rowCount;
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la suppression:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 // Fonction pour mettre à jour les week_attendance avec les données de attendance_summary
 async function update_week_attendance() {
     const client = await pool.connect();
@@ -1481,6 +2041,7 @@ async function update_week_attendance() {
                 SUM(night_hours) as total_night_hours,
                 SUM(hours_worked) as total_worked_hours,
                 SUM(normal_hours) as total_normal_hours,
+                SUM(hrs_norm_trav) as total_normal_trav,
                 SUM(penalisable) as total_penalisable,
                 SUM(jf_value) as total_jf,
                 SUM(sup_hour) as total_sup,
@@ -1510,6 +2071,7 @@ async function update_week_attendance() {
                 total_worked_hours = $5,
                 total_penalisable = $6,
                 total_normal_hour = $14,
+                total_normal_trav = $15,
                 total_sup = $7,
                 total_missed_hours = $8,
                 total_sunday_hours = $9,
@@ -1546,6 +2108,7 @@ async function update_week_attendance() {
                     const excludeMissedhour =  parseFloat(excludeData.exclude_missed_hours) || 0; // heure absence non compensées
 
                     const totalNormal = parseFloat(weeklyData.total_normal_hours) || 0;
+                    const totalNormalTrav = parseFloat(weeklyData.total_normal_trav || 0);
                     const totalWorked = parseFloat(weeklyData.total_worked_hours) || 0;
                     const totalNighthour = parseFloat(weeklyData.total_night_hours) || 0;
                     const totalMissedhour =  parseFloat(weeklyData.total_missed_hours) || 0;
@@ -1576,7 +2139,8 @@ async function update_week_attendance() {
                         parseInt(excludeData.exclude_jc) || 0,             // $11
                         parseInt(weeklyData.total_htjf) || 0,           // $12
                         parseInt(excludeData.exclude_jcx) || 0,            // $13
-                        totalNormal                                     // $14
+                        totalNormal,                                     // $14
+                        totalNormalTrav                                   //$15
                     ]);
                 }
 
@@ -1617,6 +2181,9 @@ async function attendanceSummary(employeeId,employee_innerID, date) {
         // Appel de la fonction pour traiter les shifts réguliers de l'employé
         await processRegularShifts(employeeId, date);
 
+        // Appel de la fonction pour traiter les shifts réguliers de l'employé pour aujourd'hui
+        await forToday(employeeId, date);
+
         // Appel de la fonction pour traiter les shifts de nuit de l'employé
         await processNightShifts(employeeId);
 
@@ -1634,6 +2201,35 @@ async function attendanceSummary(employeeId,employee_innerID, date) {
     }
 }
 
+// Fonction attendance_summary_for_layoff
+async function attendanceSummaryForLayoff(employeeId,employee_innerID, date) {
+    try {
+        console.log(`📅 Traitement de la présence pour l'employé ${employeeId} à la date ${date}`);
+
+        // Appel de la fonction d'initialisation de l'attendance summary
+        await initAttendanceSummary(employeeId, date);
+
+        // Appel de la fonction pour traiter les shifts de travail de l'employé
+        await employeeWorkShift(date, employeeId, employee_innerID);
+
+         // Appel de la fonction pour traiter les indisponibilités de l'employé
+         await employeeUnvailable(date, employeeId, employee_innerID);
+
+         // Appel de la fonction pour vérifier les jours fériés
+         await employeeHoliday(date, employeeId);
+
+        // Mis à jour des Heures d'absence TEST PHASE
+        await processMissedHours(employeeId, date);
+
+
+
+        console.log(`✅ Traitement de l'attendance summary terminé pour l'employé ${employeeId} à la date ${date}`);
+    } catch (error) {
+        console.error(`❌ Erreur lors du traitement de l'attendance summary pour l'employé ${employeeId} à la date ${date}:`, error);
+        throw error;
+    }
+}
+
 // fonction pour traiter les pointages sur une période donnée
 async function processMonthlyAttendance() {
 
@@ -1642,7 +2238,7 @@ async function processMonthlyAttendance() {
     const endDate = today.toISOString().split('T')[0];
 
     const start = new Date();
-    start.setDate(start.getDate() - 1);
+    start.setDate(start.getDate() - 3);
     const startDate = start.toISOString().split('T')[0];
 
     const client = await pool.connect();
@@ -1701,12 +2297,12 @@ async function apresAjoutIndisponibility(start_date, end_date, employee_id) {
     const originalStart = new Date(start_date);
     const originalEnd = new Date(end_date);
  
-     // Ajuster les dates : 3 jours avant le début et 3 jours après la fin
+     // Ajuster les dates : n jours avant le début et n jours après la fin
     const startDate = new Date(originalStart);
-    startDate.setDate(startDate.getDate() - 3);
+    startDate.setDate(startDate.getDate() - 1);
  
     const endDate = new Date(originalEnd);
-    endDate.setDate(endDate.getDate() + 3);
+    endDate.setDate(endDate.getDate() + 1);
 
     const client = await pool.connect();
     try {
@@ -1714,9 +2310,9 @@ async function apresAjoutIndisponibility(start_date, end_date, employee_id) {
 
         // Récupérer les données de l'employé
         const employeesQuery = 'SELECT id, attendance_id FROM employees WHERE id = $1';
-        const employeesResult = await client.query(employeesQuery, [employeeId]); // You need to pass the employeeId as a parameter
+        const employeesResult = await client.query(employeesQuery, [employeeId]); // pass the employeeId as a parameter
 
-        // Vérifier qu'il y a des les données de l'employé
+        // Vérifier qu'il y a les données de l'employé
         if (employeesResult.rows.length === 0) {
             console.log('Aucune donnée trouvée.');
             return;
@@ -1730,7 +2326,11 @@ async function apresAjoutIndisponibility(start_date, end_date, employee_id) {
             // Appliquer la fonction attendanceSummary  à la date spécifique
             for (const employee of employeesResult.rows) {
                 try {
-                    await attendanceSummary(employee.attendance_id,employee.id, dateString);
+                    await deletAttendanceSummary(employee.attendance_id, dateString)
+                    await attendanceSummaryForLayoff(employee.attendance_id,employee.id, dateString);
+                    await deleteAttendanceSummary(employee.attendance_id, start_date, end_date);
+                    await update_week_attendance_by_employee(employee.attendance_id, dateString);
+                    await update_monthly_attendance();
                 } catch (error) {
                     console.error(`❌ Erreur lors du traitement de l'attendance pour l'employé ${employee.attendance_id} à la date ${dateString}:`, error);
                 }
@@ -1746,7 +2346,6 @@ async function apresAjoutIndisponibility(start_date, end_date, employee_id) {
         client.release();
     }
 }
-
 
 // mis à jour de attendance summary après ajout ou modification de pointage manuel
 async function processManualAttendance(date, employeeId) {
@@ -2823,7 +3422,7 @@ async function update_monthly_attendance() {
             employee_id, payroll_id, month_start, month_end,
             total_night_hours, total_worked_hours, total_penalisable,
             total_sup, total_sunday_hours, total_missed_hours,
-            total_jf, total_jc, total_jcx, total_htjf
+            total_jf, total_jc, total_jcx, total_htjf, total_normal_trav
         )
         SELECT 
             e.attendance_id,
@@ -2855,7 +3454,8 @@ async function update_monthly_attendance() {
             COALESCE(SUM(wa.total_jf), 0),
             COALESCE(SUM(wa.total_jc), 0),
             COALESCE(SUM(wa.total_jcx), 0),
-            COALESCE(SUM(wa.total_htjf), 0)
+            COALESCE(SUM(wa.total_htjf), 0),
+            COALESCE(SUM(wa.total_normal_trav), 0)
 
         FROM week_attendance wa
         JOIN employees e ON wa.employee_id = e.attendance_id
@@ -2889,6 +3489,7 @@ async function update_monthly_attendance() {
             total_jc = EXCLUDED.total_jc,
             total_jcx = EXCLUDED.total_jcx,
             total_htjf = EXCLUDED.total_htjf,
+            total_normal_trav = EXCLUDED.total_normal_trav,
             updated_at = NOW()
         `;
 
@@ -3014,6 +3615,275 @@ async function prime_assiduite() {
 
 
 
+// Fonction pour traiter les pointages POUR UN EMPLOYEE A UNE DATE donnée
+async function process() {
+    // Constants for business rules
+    const REGULAR_SHIFT_START_MINUTES = 4 * 60; // 4:00 AM (04:00)
+    const REGULAR_SHIFT_END_MINUTES = 21 * 60; // 9:00 PM (21:00)
+    const MIN_WORK_HOURS = 0;
+    const HOURS_PRECISION = 2;
+    const employeeId = 1589;
+    const date = '2025-08-02';
+
+    // Date calculations
+    const targetDate = new Date(date);
+    const startDate = new Date(targetDate);
+    const endDate = new Date(targetDate);
+    startDate.setDate(targetDate.getDate() - 2);
+    endDate.setDate(targetDate.getDate() - 1);
+
+    await initAttendanceSummary(employeeId, date);  // création de l'Attendance summary
+
+    if (!Number.isInteger(Number(employeeId))) {
+        throw new Error(`Invalid employee ID: ${employeeId}`);
+    }
+
+    const client = await pool.connect();
+    try {
+        console.log(`🌞 Calcul de pointage de employee de Matricule: ${employeeId} à la date ${date}`);
+
+        // 1. Fetch all regular shifts
+        const regularShiftsQuery = `
+        WITH ordered_punches AS (
+            SELECT 
+                id, 
+                employee_id, 
+                punch_time, 
+                punch_type,
+                DATE(punch_time) AS punch_date,
+                EXTRACT(HOUR FROM punch_time) * 60 + EXTRACT(MINUTE FROM punch_time) AS minutes_in_day
+            FROM attendance_records
+            WHERE employee_id = $1
+              AND DATE(punch_time) BETWEEN $4::date AND $5::date
+              AND (EXTRACT(HOUR FROM punch_time) * 60 + EXTRACT(MINUTE FROM punch_time) 
+                   BETWEEN $2 AND $3)
+        )
+        SELECT 
+            punch_time,
+            punch_type,
+            punch_date
+        FROM ordered_punches
+        ORDER BY punch_time
+        `;
+
+        const shifts = await client.query(regularShiftsQuery, [
+            employeeId,
+            REGULAR_SHIFT_START_MINUTES,
+            REGULAR_SHIFT_END_MINUTES,
+            startDate,
+            endDate
+        ]);
+
+        // Group shifts by date
+        const shiftsByDate = {};
+        shifts.rows.forEach(shift => {
+            const dateKey = shift.punch_date.toISOString().split('T')[0];
+            if (!shiftsByDate[dateKey]) {
+                shiftsByDate[dateKey] = [];
+            }
+            shiftsByDate[dateKey].push(shift);
+        });
+
+        // Process each day
+        for (const [dateKey, dayShifts] of Object.entries(shiftsByDate)) {
+            try {
+                // Get all punches for the day
+                const allPunchesQuery = `
+                    SELECT 
+                        punch_time,
+                        punch_type
+                    FROM attendance_records
+                    WHERE employee_id = $1
+                      AND DATE(punch_time) = $2
+                    ORDER BY punch_time;
+                `;
+                const allPunches = await client.query(allPunchesQuery, [employeeId, dateKey]);
+
+                // Initialize variables
+                let getin = null;
+                let getout = null;
+                let autoriz_getin = null;
+                let autoriz_getout = null;
+                let workedHours = 0;
+
+                // Process punches
+                if (allPunches.rows.length >= 2) {
+                    // First IN is getin
+                    const firstIn = allPunches.rows.find(p => p.punch_type === 'IN');
+                    if (firstIn) getin = formatTime(firstIn.punch_time);
+
+                    // Last OUT is getout
+                    const lastOut = [...allPunches.rows].reverse().find(p => p.punch_type === 'OUT');
+                    if (lastOut) getout = formatTime(lastOut.punch_time);
+
+                    // Special case: exactly 4 punches
+                    if (allPunches.rows.length === 4 && 
+                        allPunches.rows[0].punch_type === 'IN' &&
+                        allPunches.rows[1].punch_type === 'OUT' &&
+                        allPunches.rows[2].punch_type === 'IN' &&
+                        allPunches.rows[3].punch_type === 'OUT') {
+                        
+                        autoriz_getout = formatTime(allPunches.rows[1].punch_time);
+                        autoriz_getin = formatTime(allPunches.rows[2].punch_time);
+                    }
+                    // General case: multiple punches
+                    else if (allPunches.rows.length > 2) {
+                        const inIndexes = allPunches.rows
+                            .map((p, i) => p.punch_type === 'IN' ? i : -1)
+                            .filter(i => i !== -1);
+                        
+                        const outIndexes = allPunches.rows
+                            .map((p, i) => p.punch_type === 'OUT' ? i : -1)
+                            .filter(i => i !== -1);
+
+                        if (inIndexes.length > 0 && outIndexes.length > 0) {
+                            // First OUT after first IN is autoriz_getout
+                            const firstOutAfterFirstIn = outIndexes.find(oi => oi > inIndexes[0]);
+                            if (firstOutAfterFirstIn !== undefined) {
+                                autoriz_getout = formatTime(allPunches.rows[firstOutAfterFirstIn].punch_time);
+                            }
+
+                            // Last IN before last OUT is autoriz_getin
+                            const lastInBeforeLastOut = [...inIndexes]
+                                .reverse()
+                                .find(ii => ii < outIndexes[outIndexes.length - 1]);
+                            if (lastInBeforeLastOut !== undefined) {
+                                autoriz_getin = formatTime(allPunches.rows[lastInBeforeLastOut].punch_time);
+                            }
+                        }
+                    }
+
+                    // Calculate worked hours
+                    if (getin && getout) {
+                        workedHours = (new Date(`1970-01-01T${getout}:00`) - 
+                                     new Date(`1970-01-01T${getin}:00`)) / 3600000;
+
+                        // Subtract authorization period if exists
+                        if (autoriz_getin && autoriz_getout) {
+                            const authDuration = (new Date(`1970-01-01T${autoriz_getin}:00`) - 
+                                              new Date(`1970-01-01T${autoriz_getout}:00`)) / 3600000;
+                            workedHours = Math.max(workedHours - authDuration, MIN_WORK_HOURS);
+                        }
+                    }
+                }
+
+                // Get shift summary data
+                const summaryQuery = `
+                    SELECT 
+                        getin_ref, 
+                        getout_ref,
+                        break_duration
+                    FROM attendance_summary
+                    WHERE employee_id = $1 
+                      AND date = $2
+                      AND isholidays = FALSE 
+                      AND is_conge = FALSE 
+                      AND islayoff = FALSE
+                    LIMIT 1;
+                `;
+                const summaryResult = await client.query(summaryQuery, [employeeId, dateKey]);
+                
+                if (summaryResult.rows.length === 0) continue;
+                
+                const summary = summaryResult.rows[0];
+                const getin_ref = formatTime(summary.getin_ref);
+                const getout_ref = formatTime(summary.getout_ref);
+                const breakDuration = parseFloat(summary.break_duration) || 0;
+
+                // Subtract break   
+                workedHours = parseFloat(
+                    Math.max(workedHours - breakDuration, MIN_WORK_HOURS).toFixed(HOURS_PRECISION)
+                );
+                const is_missing = (getin == null && getout == null)
+                
+                // Vérifie si le nombre de pointages est impair (indiquant une anomalie)
+                const is_anomalie = allPunches.rows.length % 2 !== 0;
+
+
+                // Update attendance summary
+                await client.query(`
+                    UPDATE attendance_summary
+                    SET 
+                        getin = $3::TIME,
+                        getout = $4::TIME,
+                        autoriz_getin = $5::TIME,
+                        autoriz_getout = $6::TIME,
+                        is_anomalie = $8,
+                        hours_worked = CASE
+                            WHEN is_sunday THEN 0
+                            ELSE $7::NUMERIC
+                        END,
+                        status = CASE
+                            WHEN ($7::NUMERIC = 0) AND is_anomalie = FALSE  THEN 'absent'
+                            WHEN getin_ref IS NULL THEN 'present'
+                            WHEN $3::TIME <= getin_ref THEN 'present'
+                            ELSE 'retard'
+                        END,
+                        get_holiday = CASE
+                            WHEN $3 IS NULL THEN FALSE
+                            WHEN getin_ref IS NULL THEN TRUE
+                            ELSE TRUE
+                        END,
+                        nbr_retard = CASE
+                            WHEN $3::TIME <= getin_ref THEN 0
+                            WHEN $3::TIME > getin_ref THEN 1
+                        END,  
+                        nbr_absence = CASE
+                            WHEN $9 IS TRUE THEN 1
+                            ELSE 0
+                        END, 
+                        nbr_depanti = CASE
+                            WHEN $4::TIME < getout_ref THEN 1
+                            ELSE 0
+                        END,
+                        sunday_hour = CASE
+                        WHEN is_sunday = TRUE THEN $7::NUMERIC
+                        ELSE 0
+                        END,
+                        sup_hour = CASE
+                        WHEN is_saturday = TRUE AND getin_ref is NULL THEN $7::NUMERIC
+                        ELSE GREATEST($7::NUMERIC - normal_hours::NUMERIC, 0 )
+                        END,
+                        missed_hour = GREATEST(COALESCE(normal_hours::NUMERIC, 0) - COALESCE(hours_worked::NUMERIC, 0), 0 ),
+                        penalisable = GREATEST(COALESCE(normal_hours::NUMERIC, 0) - COALESCE(hours_worked::NUMERIC, 0), 0 ),
+                        updated_at = NOW()
+                    WHERE employee_id = $1 AND date = $2
+                  ;
+                `, [
+                    employeeId,     //$1
+                    dateKey,        //$2
+                    getin,          //$3
+                    getout,         //$4
+                    autoriz_getin,  //$5
+                    autoriz_getout, //$6
+                    workedHours,    //$7
+                    is_anomalie,    //$8
+                    is_missing       //$9
+                ]);
+
+            } catch (dayError) {
+                console.error(`❌ Error processing day ${dateKey}:`, dayError.message);
+                continue;
+            }
+        }
+
+        console.log(`✅ Completed processing for employee ${employeeId}`);
+    } catch (error) {
+        console.error(`❌ Critical error processing employee ${employeeId}:`, error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+
+    function formatTime(dateTime) {
+        if (!dateTime || isNaN(new Date(dateTime).getTime())) return null;
+        const d = new Date(dateTime);
+        return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+}
+
+
+
 module.exports = { 
     downloadAttendance, 
     processAllAttendances, 
@@ -3030,5 +3900,7 @@ module.exports = {
     processManualAttendance,
     updateAttendanceSummaryFromTimes,
     apresAjoutIndisponibility,
-    prime_assiduite
+    prime_assiduite,
+    process,
+    deletAttendanceSummary
 };

@@ -5,8 +5,8 @@ const { apresAjoutIndisponibility } = require('../services/attendanceService');
 // créer une nouvelle mise à pied
 exports.addLayoff = async (req, res) => {
   try {
-    const { employee_id, type, start_date, end_date, nb_jour } = req.body;
-    const newLayoff = await Layoff.create({ employee_id, type, start_date, end_date, nb_jour });
+    const { employee_id, type, start_date, end_date, nb_jour, motif } = req.body;
+    const newLayoff = await Layoff.create({ employee_id, type, start_date, end_date, nb_jour, motif });
     await apresAjoutIndisponibility(start_date, end_date, employee_id);
    
     res.status(201).json(newLayoff);
@@ -18,7 +18,9 @@ exports.addLayoff = async (req, res) => {
 // obtenir toutes les mises à pied
 exports.getLayoffs = async (req, res) => {
   try {
-    const layoffs = await Layoff.findAll();
+    const layoffs = await Layoff.findAll({
+      order: [['id', 'DESC']]
+    });
     res.json(layoffs);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -42,8 +44,13 @@ exports.updateLayoff = async (req, res) => {
     if (!layoff) {
       return res.status(404).json({ error: "Layoff not found" });
     }
-    await layoff.update(req.body);
+    const is_ok = await layoff.update(req.body);
+    if (is_ok){
+      await apresAjoutIndisponibility(layoff.start_date, layoff.end_date, layoff.employee_id);  // mis à jour des données
+    }
+    
     res.json(layoff);
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -56,7 +63,15 @@ exports.deleteLayoff = async (req, res) => {
     if (!layoff) {
       return res.status(404).json({ error: "Layoff not found" });
     }
-    await layoff.destroy();
+
+    let start_date = layoff.start_date;
+    let end_date = layoff.end_date;
+    let employee_id = layoff.employee_id;
+    
+    const is_ok = await layoff.destroy(); // supprimer le layoff
+
+    if(is_ok) {await apresAjoutIndisponibility(start_date, end_date, employee_id);}  // mis à jour des données
+
     res.json({ message: "Layoff deleted successfully" });
   } catch (error) {
     res.status(500).json({ error: error.message });

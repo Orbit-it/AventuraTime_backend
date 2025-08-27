@@ -10,6 +10,7 @@ const Layoff = db.define(
       end_date: { type: DataTypes.DATE, allowNull: false },
       nb_jour: { type: DataTypes.INTEGER, allowNull: true },
       is_purged: { type: DataTypes.BOOLEAN, defaultValue: false },
+      motif: { type: DataTypes.STRING, defaultValue: false },
     },
     {
       freezeTableName: true, // Disable pluralization
