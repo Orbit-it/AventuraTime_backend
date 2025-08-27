@@ -1484,8 +1484,7 @@ async function processRegularShifts(employeeId, date) {
                 let autoriz_getin = null;
                 let autoriz_getout = null;
                 let workedHours = 0;
-
-                
+                let effective_getin = null;
 
                 // Process punches
                 if (allPunches.rows.length >= 2) {
@@ -1533,19 +1532,6 @@ async function processRegularShifts(employeeId, date) {
                             }
                         }
                     }
-
-                    // Calculate worked hours
-                    if (getin && getout) {
-                        workedHours = (new Date(`1970-01-01T${getout}:00`) - 
-                                     new Date(`1970-01-01T${getin}:00`)) / 3600000;
-
-                        // Subtract authorization period if exists
-                        if (autoriz_getin && autoriz_getout) {
-                            const authDuration = (new Date(`1970-01-01T${autoriz_getin}:00`) - 
-                                              new Date(`1970-01-01T${autoriz_getout}:00`)) / 3600000;
-                            workedHours = Math.max(workedHours - authDuration, MIN_WORK_HOURS);
-                        }
-                    }
                 }
 
                 // Get shift summary data
@@ -1567,9 +1553,34 @@ async function processRegularShifts(employeeId, date) {
                 if (summaryResult.rows.length === 0) continue;
                 
                 const summary = summaryResult.rows[0];
-                const getin_ref = formatTime(summary.getin_ref);
-                const getout_ref = formatTime(summary.getout_ref);
+                // Extraire seulement les heures et minutes de getin_ref (format HH:MM:SS)
+                const getin_ref = summary.getin_ref ? formatTimeFromString(summary.getin_ref) : null;
+                const getout_ref = summary.getout_ref ? formatTimeFromString(summary.getout_ref) : null;
                 const breakDuration = parseFloat(summary.break_duration) || 0;
+
+                // Déterminer l'heure d'entrée effective
+                if (getin && getin_ref) {
+                    const getinTime = new Date(`1970-01-01T${getin}:00`);
+                    const getinRefTime = new Date(`1970-01-01T${getin_ref}:00`);
+                    
+                    // Si getin est inférieur à getin_ref, on prend getin_ref
+                    effective_getin = getinTime < getinRefTime ? getin_ref : getin;
+                } else {
+                    effective_getin = getin; // Si une des valeurs est manquante
+                }
+
+                // Calculate worked hours avec l'heure d'entrée effective
+                if (effective_getin && getout) {
+                    workedHours = (new Date(`1970-01-01T${getout}:00`) - 
+                                 new Date(`1970-01-01T${effective_getin}:00`)) / 3600000;
+
+                    // Subtract authorization period if exists
+                    if (autoriz_getin && autoriz_getout) {
+                        const authDuration = (new Date(`1970-01-01T${autoriz_getin}:00`) - 
+                                          new Date(`1970-01-01T${autoriz_getout}:00`)) / 3600000;
+                        workedHours = Math.max(workedHours - authDuration, MIN_WORK_HOURS);
+                    }
+                }
 
                 // Subtract break   
                 workedHours = parseFloat(
@@ -1579,7 +1590,6 @@ async function processRegularShifts(employeeId, date) {
                 
                 // Vérifie si le nombre de pointages est impair (indiquant une anomalie)
                 const is_anomalie = allPunches.rows.length % 2 !== 0;
-
 
                 // Update attendance summary
                 await client.query(`
@@ -1597,7 +1607,7 @@ async function processRegularShifts(employeeId, date) {
                         status = CASE
                             WHEN ($7::NUMERIC = 0) AND is_anomalie = FALSE  THEN 'absent'
                             WHEN getin_ref IS NULL THEN 'present'
-                            WHEN $3::TIME <= getin_ref THEN 'present'
+                            WHEN $3::TIME <= getin_ref::TIME THEN 'present'
                             ELSE 'retard'
                         END,
                         get_holiday = CASE
@@ -1606,15 +1616,15 @@ async function processRegularShifts(employeeId, date) {
                             ELSE TRUE
                         END,
                         nbr_retard = CASE
-                            WHEN $3::TIME <= getin_ref THEN 0
-                            WHEN $3::TIME > getin_ref THEN 1
+                            WHEN $3::TIME <= getin_ref::TIME THEN 0
+                            WHEN $3::TIME > getin_ref::TIME THEN 1
                         END,  
                         nbr_absence = CASE
                             WHEN $9 IS TRUE THEN 1
                             ELSE 0
                         END, 
                         nbr_depanti = CASE
-                            WHEN $4::TIME < getout_ref THEN 1
+                            WHEN $4::TIME < getout_ref::TIME THEN 1
                             ELSE 0
                         END,
                         sunday_hour = CASE
@@ -1667,9 +1677,17 @@ async function processRegularShifts(employeeId, date) {
         const d = new Date(dateTime);
         return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     }
+
+    function formatTimeFromString(timeString) {
+        if (!timeString) return null;
+        // Convertir le format HH:MM:SS en HH:MM
+        const parts = timeString.split(':');
+        if (parts.length >= 2) {
+            return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+        }
+        return null;
+    }
 }
-
-
 
 
 // Fonction de Calcul et mis à jour Attendance_summary from Pointage Manuel
