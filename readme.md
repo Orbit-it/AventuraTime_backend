@@ -1,4 +1,3 @@
-l'arboresence n'est pas visible apres le commit:
 # 🕒 AventuraTime Backend
 
 **AventuraTime Backend** is the server-side application of the **AventuraTime** project.  
