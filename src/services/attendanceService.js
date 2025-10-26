@@ -61,7 +61,6 @@ async function flagAsProcessingError(employeeId) {
         [employeeId]
     );
 }
-
 /* Fonction pour classer automatiquement tous les pointages
 async function classifyAllPunchesWithLogs() {
     console.log('[Début] Reclassification de tous les pointages');
@@ -346,6 +345,59 @@ async function classifyAllPunchesWithLogs() {
         console.log('\n[Fin] Reclassification terminée');
     } catch (error) {
         console.error('[ERREUR GLOBALE]', error.stack);
+        throw error;
+    }
+}
+
+async function checkFiveMonthsAnniversary() {
+    try {
+        const currentDate = new Date();
+        const currentWeekStart = new Date(currentDate);
+        currentWeekStart.setDate(currentDate.getDate() - currentDate.getDay());
+        currentWeekStart.setHours(0, 0, 0, 0);
+        let enterprise = "STGI"   // nom de la société à mettre dans les variable global plutard !
+        
+        const currentWeekEnd = new Date(currentWeekStart);
+        currentWeekEnd.setDate(currentWeekStart.getDate() + 6);
+        currentWeekEnd.setHours(23, 59, 59, 999);
+
+        // Query employees with upcoming 5-month anniversaries
+        const result = await pool.query(`
+            SELECT attendance_id, name, hire_date
+            FROM employees 
+            WHERE hire_date IS NOT NULL
+            AND DATE(hire_date + INTERVAL '5 months') BETWEEN $1 AND $2
+        `, [currentWeekStart, currentWeekEnd]);
+
+        if (result.rows.length === 0) {
+            console.log('✓ Aucun employé ne fête ses 5 mois cette semaine');
+            return 0;
+        }
+
+        // Prepare notifications
+        const notifications = result.rows.map(employee => ({
+            employeeId: employee.attendance_id,
+            type: '5_months_anniversary',
+            message: `${employee.name} fête ses 5 mois à ${enterprise} cette semaine (recruté le ${new Date(employee.hire_date).toLocaleDateString('fr-FR')})`
+        }));
+
+        // Batch insert
+        const values = notifications.flatMap(n => [n.employeeId, n.type, n.message]);
+        const placeholders = notifications.map((_, i) => 
+            `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3}, NOW())`
+        ).join(',');
+
+        await pool.query(`
+            INSERT INTO hr_notifications 
+            (employee_id, notification_type, message, created_at)
+            VALUES ${placeholders}
+        `, values);
+
+        console.log(`✓ ${notifications.length} notifications créées pour les 5 mois d'ancienneté`);
+        return notifications.length;
+
+    } catch (error) {
+        console.error('Erreur lors de la création des notifications:', error);
         throw error;
     }
 }
@@ -637,7 +689,6 @@ function isToday(date) {
   }
   
 
-
 // Création de Attendance_summary OK en detectant si c la date d'ajourd'hui ou non 
 async function initAttendanceSummary(employeeId, date) {
     if (!Number.isInteger(Number(employeeId)) || isNaN(new Date(date).getTime())) {
@@ -778,14 +829,14 @@ async function employeeHoliday(date, employeeId) {
     }
 }
 
-// Gestion des Indisponibilités
+// Gestion des Indisponibilités (layoff)
 async function employeeUnvailable(date, employeeId, employee_innerID) {
     if (!Number.isInteger(Number(employeeId)) || isNaN(new Date(date).getTime())) {
         throw new Error(`Paramètres invalides: employeeId=${employeeId}, date=${date}`);
     }
 
     const client = await pool.connect();
-   
+
 
     try {
         console.log(`🚫 Check Indisponibilité pour l'empmloyé ${employeeId} à la date ${date}`);
@@ -805,7 +856,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
 
             console.log(`🚫 Indisponibilité pour ${employeeId} à la date ${date}`);
 
-            
+            // For each case getin_ref MUST BE PRESENT otherwise it's dayoff
             if (layof_type === 'conge') {  // pour les congès simples
                 await client.query(`
                     UPDATE attendance_summary
@@ -815,7 +866,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         get_holiday = TRUE,
                         nbr_absence = 1,
                         jc_value = 1       
-                    WHERE employee_id = $1 AND date = $2;
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
                 `, [employeeId, date]);
             } else if (layof_type === 'map') {  // pour les mis à pieds
                 await client.query(`
@@ -824,7 +875,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'map',
                         nbr_absence = 1,
                         islayoff = TRUE  
-                    WHERE employee_id = $1 AND date = $2;
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
                 `, [employeeId, date]);
             } else if (layof_type === 'accident') { // pour accident de travail
                 await client.query(`
@@ -833,8 +884,8 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'accident',
                         nbr_absence = 1,
                         is_accident = TRUE     
-                    WHERE employee_id = $1 AND date = $2;
-                `, [employeeId, date]);
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL; 
+                `, [employeeId, date]); 
 
             } else if (layof_type === 'cg_maladie') { // pour congé maladie
                 await client.query(`
@@ -843,7 +894,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'cg_maladie',
                         nbr_absence = 1,
                         is_maladie = TRUE  
-                    WHERE employee_id = $1 AND date = $2;
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
                 `, [employeeId, date]);
             }
             else if (layof_type === 'rdv_medical') { // pour rdv médical, seul effet ( ne perd pas le droit de jour férié )
@@ -853,8 +904,33 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'rdv_medical',
                         nbr_absence = 1,
                         get_holiday = TRUE      
-                    WHERE employee_id = $1 AND date = $2;
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
                 `, [employeeId, date]);
+            }
+            else if (layof_type === 'mission') { // pour les missions, seul effet ( ne perd pas le droit de jour férié )
+                await client.query(`
+                    UPDATE attendance_summary
+                    SET                   
+                        status = 'mission',
+                        nbr_absence = 0,
+                        missed_hour = 0,
+                        penalisable = 0,
+                        get_holiday = TRUE      
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                `, [employeeId, date]);    
+            }
+            else if (layof_type === 'remote') { // pour les Télétravail, seul effet ( ne perd pas le droit de jour férié )
+                await client.query(`
+                    UPDATE attendance_summary
+                    SET                   
+                        status = 'remote',
+                        nbr_absence = 0,
+                        missed_hour = 0,
+                        penalisable = 0,
+                        get_holiday = TRUE      
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                `, [employeeId, date]);       
+
             } else { // pour les congés exeptionnels 
                 await client.query(`
                     UPDATE attendance_summary
@@ -864,7 +940,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         get_holiday = TRUE,
                         is_congex = TRUE,
                         jcx_value = 1       
-                    WHERE employee_id = $1 AND date = $2;
+                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
                 `, [employeeId, date]);
             } 
         } else {
@@ -935,7 +1011,7 @@ async function employeeWorkShift(date, employeeId, employee_innerID) {
                 getin_ref = $4,
                 break_duration = $5,
                 getout_ref = $6
-            WHERE employee_id = $1 AND date = $2 AND isholidays = FALSE AND is_conge = FALSE AND islayoff = FALSE AND do_not_touch is NULL;
+            WHERE employee_id = $1 AND date = $2 AND isholidays = FALSE AND is_conge = FALSE AND islayoff = FALSE AND do_not_touch is NULL AND status NOT IN ('mission', 'remote');
         `, [employeeId, date, workDuration, startTime, break_duration, endTime]);
         
         console.log(`✅ Shift mis à jour pour ${employeeId} à la date ${date}`);
@@ -1318,6 +1394,7 @@ async function forToday(employeeId, date) {
                     AND is_congex IS NOT TRUE  
                     AND do_not_touch IS NOT TRUE
                     AND is_maladie IS NOT TRUE  
+                    AND status NOT IN ('mission', 'remote')
                     AND is_accident IS NOT TRUE ;
                 `, [
                     employeeId, //$1
@@ -1387,6 +1464,7 @@ async function processMissedHours(employeeId, date) {
               AND is_congex IS NOT TRUE 
               AND do_not_touch IS NOT TRUE 
               AND is_maladie IS NOT TRUE  
+              AND status NOT IN ('mission', 'remote')
               AND is_accident IS NOT TRUE;
         `, [employeeId, date]);
 
@@ -1487,43 +1565,38 @@ async function processRegularShifts(employeeId, date) {
                 let effective_getin = null;
 
                 // Process punches
-                if (allPunches.rows.length >= 2) {
-                    // First IN is getin
+                if (allPunches.rows.length === 4) {
+                    // Cas exact de 4 pointages
+                    getin = formatTime(allPunches.rows[0].punch_time);
+                    autoriz_getout = formatTime(allPunches.rows[1].punch_time);
+                    autoriz_getin = formatTime(allPunches.rows[2].punch_time);
+                    getout = formatTime(allPunches.rows[3].punch_time);
+                }
+                else if (allPunches.rows.length >= 2) {
+                    // Cas générique (2, 3, 5, 6, etc.)
                     const firstIn = allPunches.rows.find(p => p.punch_type === 'IN');
                     if (firstIn) getin = formatTime(firstIn.punch_time);
 
-                    // Last OUT is getout
                     const lastOut = [...allPunches.rows].reverse().find(p => p.punch_type === 'OUT');
                     if (lastOut) getout = formatTime(lastOut.punch_time);
 
-                    // Special case: exactly 4 punches
-                    if (allPunches.rows.length === 4 && 
-                        allPunches.rows[0].punch_type === 'IN' &&
-                        allPunches.rows[1].punch_type === 'OUT' &&
-                        allPunches.rows[2].punch_type === 'IN' &&
-                        allPunches.rows[3].punch_type === 'OUT') {
-                        
-                        autoriz_getout = formatTime(allPunches.rows[1].punch_time);
-                        autoriz_getin = formatTime(allPunches.rows[2].punch_time);
-                    }
-                    // General case: multiple punches
-                    else if (allPunches.rows.length > 2) {
+                    if (allPunches.rows.length > 2) {
                         const inIndexes = allPunches.rows
                             .map((p, i) => p.punch_type === 'IN' ? i : -1)
                             .filter(i => i !== -1);
-                        
+
                         const outIndexes = allPunches.rows
                             .map((p, i) => p.punch_type === 'OUT' ? i : -1)
                             .filter(i => i !== -1);
 
                         if (inIndexes.length > 0 && outIndexes.length > 0) {
-                            // First OUT after first IN is autoriz_getout
+                            // Premier OUT après premier IN → autoriz_getout
                             const firstOutAfterFirstIn = outIndexes.find(oi => oi > inIndexes[0]);
                             if (firstOutAfterFirstIn !== undefined) {
                                 autoriz_getout = formatTime(allPunches.rows[firstOutAfterFirstIn].punch_time);
                             }
 
-                            // Last IN before last OUT is autoriz_getin
+                            // Dernier IN avant dernier OUT → autoriz_getin
                             const lastInBeforeLastOut = [...inIndexes]
                                 .reverse()
                                 .find(ii => ii < outIndexes[outIndexes.length - 1]);
@@ -1533,6 +1606,7 @@ async function processRegularShifts(employeeId, date) {
                         }
                     }
                 }
+
 
                 // Get shift summary data
                 const summaryQuery = `
@@ -1563,8 +1637,8 @@ async function processRegularShifts(employeeId, date) {
                     const getinTime = new Date(`1970-01-01T${getin}:00`);
                     const getinRefTime = new Date(`1970-01-01T${getin_ref}:00`);
                     
-                    // Si getin est inférieur à getin_ref, on prend getin_ref
-                    effective_getin = getinTime < getinRefTime ? getin_ref : getin;
+                    // Si getin est inférieur à getin_ref, on prend getin_ref ///// a optimiser
+                    effective_getin = (getinTime <= getinRefTime) ?getin_ref : getin;
                 } else {
                     effective_getin = getin; // Si une des valeurs est manquante
                 }
@@ -1645,6 +1719,7 @@ async function processRegularShifts(employeeId, date) {
                     AND is_congex IS NOT TRUE  
                     AND do_not_touch IS NOT TRUE
                     AND is_maladie IS NOT TRUE  
+                    AND status NOT IN ('mission', 'remote')
                     AND is_accident IS NOT TRUE ;
                 `, [
                     employeeId,     //$1
@@ -1840,7 +1915,7 @@ async function updateAttendanceSummaryFromTimes(employeeId, date, getin, getout,
                     ELSE 0
                 END,
                 sup_hour = CASE
-                    WHEN is_saturday = TRUE THEN GREATEST($5::NUMERIC - $7::NUMERIC, 0)
+                    WHEN is_sunday IS NOT TRUE THEN GREATEST($5::NUMERIC - $7::NUMERIC, 0)
                     ELSE 0
                 END,
                 missed_hour = GREATEST($7::NUMERIC - $5::NUMERIC, 0),
@@ -1871,13 +1946,6 @@ async function updateAttendanceSummaryFromTimes(employeeId, date, getin, getout,
     }
 }
 
-// Helper function to check if a date is today
-function isToday(date) {
-    const today = new Date();
-    return date.getDate() === today.getDate() &&
-           date.getMonth() === today.getMonth() &&
-           date.getFullYear() === today.getFullYear();
-}
 
 
 // Fonction pour eliminer les attendance_summary weekend sans travail ou sans pointages
@@ -1903,6 +1971,7 @@ async function deleteUnusedAttendanceSummary(employeeId = null) {
                 is_accident = FALSE AND
                 is_weekend = TRUE AND
                 is_anomalie = FALSE AND
+                status NOT IN ('mission', 'remote') AND
                 is_today = FALSE
         `;
         
@@ -1985,6 +2054,7 @@ async function cleanAttendanceSummary(employeeId) {
                 is_maladie = FALSE AND 
                 is_accident = FALSE AND
                 is_anomalie = FALSE AND
+                status NOT IN ('mission', 'remote') AND
                 is_today = FALSE
         `;
         
@@ -2067,18 +2137,36 @@ async function update_week_attendance() {
                 SUM(sunday_hour) as total_sunday_hours,
                 SUM(worked_hours_on_holidays) as total_htjf
             FROM attendance_summary
-            WHERE employee_id = $1 AND status <> 'map' AND status <> 'conge'
+            WHERE employee_id = $1 AND status <> 'map' AND status <> 'conge' AND status <> 'cg_exp'
             AND date BETWEEN $2 AND $3
         `;
 
         const getWeeklySummaryQuery_exclude = `
             SELECT 
                 SUM(missed_hour) as exclude_missed_hours,
-                SUM(jc_value) as exclude_jc,
-                SUM(jcx_value) as exclude_jcx
+                SUM(jc_value) as exclude_jc
             FROM attendance_summary
             WHERE employee_id = $1 
-            AND (status = 'map' OR status = 'conge')
+            AND status = 'conge'
+            AND date BETWEEN $2 AND $3
+        `;
+
+        const getWeeklySummaryQuery_map = `
+        SELECT 
+            SUM(missed_hour) as map_missed_hours
+        FROM attendance_summary
+        WHERE employee_id = $1 
+        AND status = 'map'
+        AND date BETWEEN $2 AND $3
+    `;
+
+        const getWeeklySummaryQuery_exep = `
+            SELECT 
+                SUM(missed_hour) as exep_missed_hours,
+                SUM(jcx_value) as exep_jcx
+            FROM attendance_summary
+            WHERE employee_id = $1 
+            AND status = 'cg_exp'
             AND date BETWEEN $2 AND $3
         `;
 
@@ -2110,20 +2198,35 @@ async function update_week_attendance() {
                 );
 
                 for (const week of weeks) {
-
+                    // normal
                     const { rows: [weeklyData] } = await client.query(getWeeklySummaryQuery, [
                         employee.attendance_id,
                         week.start_date,
                         week.end_date
                     ]);
 
-                    // ecluded sum
+                    // mis à pied somme
+                    const { rows: [mapData] } = await client.query(getWeeklySummaryQuery_map, [
+                        employee.attendance_id,
+                        week.start_date,
+                        week.end_date
+                    ]);
+
+                    // conge simple somme
                     const { rows: [excludeData] } = await client.query(getWeeklySummaryQuery_exclude, [
                         employee.attendance_id,
                         week.start_date,
                         week.end_date
                     ]);
-                    const excludeMissedhour =  parseFloat(excludeData.exclude_missed_hours) || 0; // heure absence non compensées
+                    // conge exceptionnel somme
+                    const { rows: [exepData] } = await client.query(getWeeklySummaryQuery_exep, [
+                        employee.attendance_id,
+                        week.start_date,
+                        week.end_date
+                    ]);
+                    const excludeMissedhour =  parseFloat(excludeData.exclude_missed_hours) || 0; // heure absence non compensées (mise à pied // congé)
+                    const exepMissedhour =  parseFloat(exepData.exep_missed_hours) || 0; // heure absence non compensées (congé excep)
+                    const mapMissedhour = parseFloat(mapData.map_missed_hours) || 0;   // heure absence non compensées (mis à pied)
 
                     const totalNormal = parseFloat(weeklyData.total_normal_hours) || 0;
                     const totalNormalTrav = parseFloat(weeklyData.total_normal_trav || 0);
@@ -2133,7 +2236,7 @@ async function update_week_attendance() {
                     const totalSup50 = parseFloat(weeklyData.total_sup) || 0;
                     let totalsup = Math.max((totalWorked - 48), 0); // Heure sup calculé au delà de 48h par semaine !
                     const compasedHour = totalMissedhour - totalSup50;
-                    const totalMissed = Math.max(compasedHour, 0) + excludeMissedhour;  
+                    const totalMissed = Math.max(compasedHour, 0) + excludeMissedhour + exepMissedhour + mapMissedhour;  
                     const totalPenalisable = Math.max((totalMissed - totalNighthour), 0);
 
                     if (compasedHour > 0) {
@@ -2156,7 +2259,7 @@ async function update_week_attendance() {
                         parseInt(weeklyData.total_jf) || 0,             // $10
                         parseInt(excludeData.exclude_jc) || 0,             // $11
                         parseInt(weeklyData.total_htjf) || 0,           // $12
-                        parseInt(excludeData.exclude_jcx) || 0,            // $13
+                        parseInt(exepData.exep_jcx) || 0,            // $13
                         totalNormal,                                     // $14
                         totalNormalTrav                                   //$15
                     ]);
@@ -2256,7 +2359,7 @@ async function processMonthlyAttendance() {
     const endDate = today.toISOString().split('T')[0];
 
     const start = new Date();
-    start.setDate(start.getDate() - 3);
+    start.setDate(start.getDate() - 5);
     const startDate = start.toISOString().split('T')[0];
 
     const client = await pool.connect();
@@ -2296,6 +2399,9 @@ async function processMonthlyAttendance() {
 
         // Mise à jour de la prime d'assiduité
         await prime_assiduite();
+
+        // Verifier les Employees qui ont 5 mois d'anniversaires
+        await checkFiveMonthsAnniversary();
 
         console.log(`✅ Traitement des résumés d'attendance terminé pour tous les employés.`);
 
@@ -2344,9 +2450,7 @@ async function apresAjoutIndisponibility(start_date, end_date, employee_id) {
             // Appliquer la fonction attendanceSummary  à la date spécifique
             for (const employee of employeesResult.rows) {
                 try {
-                    await deletAttendanceSummary(employee.attendance_id, dateString)
-                    await attendanceSummaryForLayoff(employee.attendance_id,employee.id, dateString);
-                    await deleteAttendanceSummary(employee.attendance_id, start_date, end_date);
+                    await deleteAttendanceSummary(employee.attendance_id, dateString, dateString);
                     await update_week_attendance_by_employee(employee.attendance_id, dateString);
                     await update_monthly_attendance();
                 } catch (error) {
@@ -2983,7 +3087,7 @@ async function init_week_attendance(month = moment().startOf('month')) {
         // Requête d'insertion pour la nouvelle structure
         const insertQuery = `
             INSERT INTO week_attendance (
-                name, employee_id, start_date, end_date, 
+                name, employee_id, start_date, end_date, total_normal_trav,
                 total_night_hours, total_worked_hours, total_penalisable, 
                 total_sup, total_missed_hours, total_sunday_hours, 
                 total_jf, total_jc, total_htjf, total_jcx
@@ -2991,7 +3095,7 @@ async function init_week_attendance(month = moment().startOf('month')) {
                 $1, $2, $3, $4,
                 $5, $6, $7,
                 $8, $9, $10,
-                $11, $12, $13, $14
+                $11, $12, $13, $14, $15
             )
             ON CONFLICT (name, employee_id) DO NOTHING
         `;
@@ -3029,6 +3133,7 @@ async function init_week_attendance(month = moment().startOf('month')) {
                         employee.attendance_id,
                         week.start.format('YYYY-MM-DD'),
                         week.end.format('YYYY-MM-DD'),
+                        0, // total_normal_trav
                         0, // total_night_hours
                         0, // total_worked_hours
                         0, // total_penalisable
@@ -3210,6 +3315,7 @@ async function update_week_attendance_by_employee( employeeId, date) {
         const getWeeklySummaryQuery = `
             SELECT 
                 SUM(night_hours) as total_night_hours,
+                SUM(hrs_norm_trav) as total_normal_trav,
                 SUM(hours_worked) as total_worked_hours,
                 SUM(penalisable) as total_penalisable,
                 SUM(sup_hour) as total_sup,
@@ -3228,6 +3334,7 @@ async function update_week_attendance_by_employee( employeeId, date) {
             UPDATE week_attendance
             SET 
                 total_night_hours = $4,
+                total_normal_trav = $14,
                 total_worked_hours = $5,
                 total_penalisable = $6,
                 total_sup = $7,
@@ -3275,7 +3382,8 @@ async function update_week_attendance_by_employee( employeeId, date) {
                     parseInt(weeklyData.total_jf) || 0,
                     parseInt(weeklyData.total_jc) || 0,
                     parseInt(weeklyData.total_htjf) || 0,
-                    parseInt(weeklyData.total_jcx) || 0
+                    parseInt(weeklyData.total_jcx) || 0,
+                    parseFloat(weeklyData.total_normal_hours) || 0
                 ]);
             }
 

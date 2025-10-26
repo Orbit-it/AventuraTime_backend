@@ -774,6 +774,7 @@ exports.getAttendanceSummary = async (req, res) => {
               is_today,
               is_anomalie,
               is_congex,
+              getin_ref,
               night_getin,
               night_getout,
               autoriz_getin,
