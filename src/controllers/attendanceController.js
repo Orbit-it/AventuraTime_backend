@@ -739,7 +739,7 @@ exports.getAttendanceWithMultipleShifts = async (req, res) => {
   }
 };
 
-
+//===========================================================================
 // Récupérer les pointages avec les données 
 exports.getAttendanceSummary = async (req, res) => {
   try {
@@ -831,6 +831,102 @@ exports.getAttendanceSummary = async (req, res) => {
   }
 };
 
+// Récupérer les pointages avec les données par période et employé
+exports.getAttendanceByPeriod = async (req, res) => {
+  try {
+    const { start_date, end_date, employee_id } = req.params;
+
+    // 1️⃣ Valider les paramètres requis
+    if (!start_date || !end_date || !employee_id) {
+      return res.status(400).json({ 
+        error: "Les paramètres start_date, end_date et employee_id sont requis" 
+      });
+    }
+
+    // 2️⃣ Construire la requête SQL de base
+    let query = `
+      SELECT 
+        employee_id, 
+        TO_CHAR(date, 'YYYY-MM-DD') AS date,
+        status, 
+        hours_worked, 
+        normal_hours,
+        missed_hour, 
+        penalisable, 
+        hrs_norm_trav,
+        is_weekend,
+        is_conge,
+        islayoff,
+        jf_value,
+        jc_value,
+        jcx_value,
+        worked_hours_on_holidays,
+        isholidays,
+        islayoff,
+        sup_hour, 
+        has_night_shift,
+        night_hours, 
+        sunday_hour, 
+        is_accident,
+        is_maladie,
+        is_today,
+        is_anomalie,
+        is_congex,
+        getin_ref,
+        night_getin,
+        night_getout,
+        autoriz_getin,
+        autoriz_getout,
+        getin,
+        getout
+      FROM attendance_summary
+      WHERE date BETWEEN $1 AND $2
+        AND employee_id = $3
+    `;
+
+    const params = [start_date, end_date, employee_id];
+
+    // 3️⃣ Trier les résultats par date croissante
+    query += ` ORDER BY date ASC`;
+
+    // 4️⃣ Exécuter la requête
+    const result = await pool.query(query, params);
+
+    if (!result || !result.rows.length) {
+      return res.status(404).json({ 
+        message: "Aucune donnée trouvée pour cette période et cet employé." 
+      });
+    }
+
+    // 5️⃣ Formater les heures en "hh:mm" (ignorer les secondes)
+    const formattedResults = result.rows.map(row => {
+      const formatTime = (time) => {
+        if (!time) return null;
+        return time.slice(0, 5); // Extraire les 5 premiers caractères (hh:mm)
+      };
+
+      return {
+        ...row,
+        getin: formatTime(row.getin),
+        getout: formatTime(row.getout),
+        night_getin: formatTime(row.night_getin),
+        night_getout: formatTime(row.night_getout),
+        autoriz_getin: formatTime(row.autoriz_getin),
+        autoriz_getout: formatTime(row.autoriz_getout)
+      };
+    });
+
+    // 6️⃣ Retourner les résultats formatés
+    res.status(200).json(formattedResults);
+  } catch (error) {
+    console.error('❌ Erreur lors de la récupération des données :', error);
+    res.status(500).json({ 
+      error: 'Erreur serveur lors de la récupération des données.' 
+    });
+  }
+};
+//===========================================================================
+
 // Récupérer les pointages avec les données 
 exports.getWeekAttendanceSummary = async (req, res) => {
   try {
@@ -900,7 +996,7 @@ exports.addManualAttendance = async (req, res) => {
         // Option 2: Mettre à jour le pointage existant
         const updateQuery = `
           UPDATE attendance_records 
-          SET punch_time = $1, punch_source = 'MANUAL_CORRECTED'
+          SET punch_time = $1, punch_source = 'CORRECTED'
           WHERE id = $2
           RETURNING *;
         `;
@@ -1311,7 +1407,6 @@ exports.getMissedbyInterval = async (req, res) => {
       AND getin_ref IS NOT NULL 
       AND hours_worked IS NULL 
       AND isholidays IS NOT TRUE
-      AND islayoff IS NOT TRUE
       AND has_night_shift IS NOT TRUE
     `;
     const attendanceParams = [startDate, endDate];
@@ -1566,6 +1661,68 @@ exports.markNotificationAsRead = async (req, res) => {
   }
 };
 
+
+exports.markNotificationAsResolved = async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const { notification_ids } = req.body;
+    
+    // Vérifier si on a des IDs
+    if (!notification_ids || !Array.isArray(notification_ids) || notification_ids.length === 0) {
+      return res.status(400).json({ error: "Liste d'IDs de notification invalide" });
+    }
+
+    await client.query('BEGIN'); // Début de transaction
+
+    // Créer une liste de paramètres pour la requête ($1, $2, etc.)
+    const params = notification_ids.map((_, index) => `$${index + 1}`).join(',');
+    
+    // Première requête: vérifier l'existence des notifications
+    const checkQuery = {
+      text: `SELECT COUNT(*) FROM hr_notifications WHERE id IN (${params}) AND resolved = false`,
+      values: notification_ids
+    };
+    
+    const checkResult = await client.query(checkQuery);
+    const existingCount = parseInt(checkResult.rows[0].count);
+    
+    if (existingCount !== notification_ids.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ 
+        error: "Certaines notifications n'existent pas ou sont déjà résolues",
+        details: {
+          requested: notification_ids.length,
+          found: existingCount
+        }
+      });
+    }
+
+    // Mettre à jour les notifications en une seule requête
+    const updateQuery = {
+      text: `UPDATE hr_notifications SET resolved = true WHERE id IN (${params})`,
+      values: notification_ids
+    };
+    
+    await client.query(updateQuery);
+    await client.query('COMMIT'); // Validation de la transaction
+    
+    res.status(200).json({ 
+      success: true,
+      updated_count: existingCount
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK'); // Annulation en cas d'erreur
+    console.error("Erreur de mise à jour de notification:", error);
+    res.status(500).json({ 
+      error: "Erreur serveur",
+      details: error.message 
+    });
+  } finally {
+    client.release(); // Libération du client
+  }
+};
 
 
 

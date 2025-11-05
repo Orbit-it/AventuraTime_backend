@@ -199,6 +199,88 @@ const deleteShift = async (req, res) => {
 };
 
 
+const assignNewEmployeeToShifts = async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { employee_id, department_id, hire_date } = req.body;
+
+        await client.query("BEGIN"); // Début de la transaction
+
+        // 1️⃣ Récupérer tous les work_shifts actifs pour le département du nouvel employé
+        const activeShiftsQuery = `
+            SELECT ws.id, ws.start_date, ws.end_date 
+            FROM work_shifts ws
+            JOIN work_shift_departments wsd ON ws.id = wsd.work_shift_id
+            WHERE wsd.department_id = $1 
+            AND (ws.end_date IS NULL OR ws.end_date >= CURRENT_DATE)
+            AND ws.start_date <= CURRENT_DATE;
+        `;
+
+        const shiftsResult = await client.query(activeShiftsQuery, [department_id]);
+
+        // 2️⃣ Assigner le nouvel employé à tous les shifts actifs de son département
+        if (shiftsResult.rows.length > 0) {
+            const assignmentQuery = `
+                INSERT INTO employee_work_shifts (employee_id, work_shift_id, start_date, end_date)
+                VALUES ${shiftsResult.rows.map((_, i) => `($1, $${i * 3 + 2}, $${i * 3 + 3}, $${i * 3 + 4})`).join(",")}
+                ON CONFLICT (employee_id, work_shift_id) DO NOTHING;
+            `;
+
+            const assignmentValues = [employee_id];
+           
+            shiftsResult.rows.forEach(shift => {
+                // Fonction pour obtenir le dernier 26 avant la date de référence
+                function getLast26thBeforeDate(referenceDate) {
+                    const refDate = new Date(referenceDate);
+                    const currentYear = refDate.getFullYear();
+                    const currentMonth = refDate.getMonth();
+                    const currentDay = refDate.getDate();
+                    
+                    // Si c'est le 26 ou après le 26 du mois courant, prendre le 26 du mois courant
+                    if (currentDay >= 26) {
+                        const result = new Date(refDate);
+                        result.setDate(26);
+                        return result;
+                    } 
+                    // Si c'est avant le 26, prendre le 26 du mois précédent
+                    else {
+                        const result = new Date(refDate);
+                        result.setMonth(result.getMonth() - 1);
+                        result.setDate(26);
+                        
+                        // Gestion des cas où le mois précédent n'a pas 26 jours
+                        if (result.getDate() !== 26) {
+                            result.setDate(0); // Dernier jour du mois précédent
+                        }
+                        
+                        return result;
+                    }
+                }
+                
+                // Utiliser la date d'embauche comme date de référence
+                const effectiveStartDate = getLast26thBeforeDate(hire_date);
+                assignmentValues.push(shift.id, effectiveStartDate, shift.end_date);
+            });
+
+            await client.query(assignmentQuery, assignmentValues);
+        }
+
+        await client.query("COMMIT"); // Validation de la transaction
+
+        res.json({ 
+            message: "Employee assigned to shifts successfully",
+            assigned_shifts: shiftsResult.rows.length
+        });
+    } catch (error) {
+        await client.query("ROLLBACK"); // Annulation en cas d'erreur
+        console.error("Error assigning employee to shifts:", error);
+        res.status(500).json({ error: "Internal Server Error" });
+    } finally {
+        client.release();
+    }
+};
+
+
 
 
 
@@ -207,6 +289,7 @@ module.exports = {
     getShifts,
     createShift,
     updateShift,
-    deleteShift
+    deleteShift,
+    assignNewEmployeeToShifts
 };
 

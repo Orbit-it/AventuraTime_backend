@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const pool = require('../config/dbAventuraTime');
 const { downloadAttendance, processAllAttendances, processEmployeeAttendance, processAllNightShifts, init_week_attendance, update_week_attendance, init_month_attendance, update_monthly_attendance,
-    processMonthlyAttendance, classifyAllPunchesWithLogs, verifyAndFixPunchSequence, process } = require('./attendanceService');
+    processMonthlyAttendance,processRegularShifts, classifyAllPunchesWithLogs, verifyAndFixPunchSequence, process } = require('./attendanceService');
 const { getMachines } = require('../controllers/machineController');
     
     
@@ -24,10 +24,10 @@ async function runAttendanceJob() {
 
 //cron.schedule('28 17 * * *', init_month_attendance ); // Appel de creation des weekly attendance
 
-//cron.schedule('25 15 * * *', update_week_attendance ); // Appel de creation des weekly attendance
-//cron.schedule('27 15 * * *', update_monthly_attendance ); // Appel de mise à jour de la table week_attendance
-//cron.schedule('14 15 * * *', init_week_attendance ); // Mettre à jour les poinatages journaliers sur attendance_summary
-//cron.schedule('21 12 * * *', process); // 
+cron.schedule('16 11 * * *', update_week_attendance ); // Appel de creation des weekly attendance
+cron.schedule('52 17 * * *', update_monthly_attendance ); // Appel de mise à jour de la table week_attendance
+cron.schedule('53 10 * * *', init_week_attendance ); // Mettre à jour les poinatages journaliers sur attendance_summary
+//cron.schedule('24 17 * * *', processRegularShifts); // 
 //cron.schedule('39 16 * * *', classifyAllPunchesWithLogs ); // Classification des Poinatges en IN et OUT
 //cron.schedule('16 10 * * *', verifyAndFixPunchSequence ); // Verification et correction des sequences IN / OUT et notif du Service RH
 

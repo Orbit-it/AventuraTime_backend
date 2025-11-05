@@ -1,10 +1,32 @@
 const Employees = require('../models/Employees');
+const {assignNewEmployeeToShifts} = require('./shiftController');
 
-// Ajouter un employé plus avec un avatar
+// Ajouter un employé 
 exports.addEmployee = async (req, res) => {
   try {
     // req.body contient déjà avatarPath si uploadé
     const newEmployee = await Employees.create(req.body);
+    
+    // Appeler la fonction d'assignation des shifts après la création
+    // Créer une requête factice avec les paramètres nécessaires
+    const mockReq = {
+      body: {
+        employee_id: newEmployee.id,
+        department_id: newEmployee.department_id,
+        hire_date: newEmployee.hire_date
+      }
+    };
+    
+    // Créer une réponse personnalisée pour ne pas interférer avec la réponse principale
+    const mockRes = {
+      json: (data) => {
+        console.log("Employee ajouté au planning:", data);
+      },
+      status: () => mockRes
+    };
+    
+    await assignNewEmployeeToShifts(mockReq, mockRes);
+    
     res.status(201).json(newEmployee);
   } catch (error) {
     res.status(400).json({ error: error.message });

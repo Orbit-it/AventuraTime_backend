@@ -1484,12 +1484,12 @@ async function processRegularShifts(employeeId, date) {
     const MIN_WORK_HOURS = 0;
     const HOURS_PRECISION = 2;
 
-    // Date calculations
-    const targetDate = new Date(date);
-    const startDate = new Date(targetDate);
-    const endDate = new Date(targetDate);
-    startDate.setDate(targetDate.getDate() - 2);
-    endDate.setDate(targetDate.getDate() - 1);
+    
+    // Construire manuellement les bornes locales sans décalage UTC
+    const startDate = `${date} 00:00:00`;
+    const endDate = `${date} 23:59:59`;
+
+
 
     if (!Number.isInteger(Number(employeeId))) {
         throw new Error(`Invalid employee ID: ${employeeId}`);
@@ -1511,7 +1511,7 @@ async function processRegularShifts(employeeId, date) {
                 EXTRACT(HOUR FROM punch_time) * 60 + EXTRACT(MINUTE FROM punch_time) AS minutes_in_day
             FROM attendance_records
             WHERE employee_id = $1
-              AND DATE(punch_time) BETWEEN $4::date AND $5::date
+              AND punch_time BETWEEN $4::timestamp AND $5::timestamp
               AND (EXTRACT(HOUR FROM punch_time) * 60 + EXTRACT(MINUTE FROM punch_time) 
                    BETWEEN $2 AND $3)
         )
@@ -1556,6 +1556,8 @@ async function processRegularShifts(employeeId, date) {
                 `;
                 const allPunches = await client.query(allPunchesQuery, [employeeId, dateKey]);
 
+                console.log("les punchs par date", allPunches.rows);
+
                 // Initialize variables
                 let getin = null;
                 let getout = null;
@@ -1565,6 +1567,7 @@ async function processRegularShifts(employeeId, date) {
                 let effective_getin = null;
 
                 // Process punches
+                console.log("Nombre de punch: ", allPunches.rows.length);
                 if (allPunches.rows.length === 4) {
                     // Cas exact de 4 pointages
                     getin = formatTime(allPunches.rows[0].punch_time);
@@ -1580,7 +1583,7 @@ async function processRegularShifts(employeeId, date) {
                     const lastOut = [...allPunches.rows].reverse().find(p => p.punch_type === 'OUT');
                     if (lastOut) getout = formatTime(lastOut.punch_time);
 
-                    if (allPunches.rows.length > 2) {
+                    if (allPunches.rows.length === 3) {
                         const inIndexes = allPunches.rows
                             .map((p, i) => p.punch_type === 'IN' ? i : -1)
                             .filter(i => i !== -1);
@@ -2003,10 +2006,14 @@ async function deleteAttendanceSummary(employeeId = null, start_date, end_date) 
     try {
         console.log('Nettoyage des summaries weekend sans getin_ref');
         
-        // Construction plus sécurisée avec pg-format ou template literals
+        //  with pg-format or template literals
         const conditions = [
-            'getin_ref IS NULL',
+            'getin_ref IS NULL',   
             'is_weekend = TRUE',
+            'sup_hour IS NULL',      // not working on saturday
+            'night_hours IS NULL',   // not having night shift
+            'sunday_hour IS NULL',   // not working on sunday
+
             `date BETWEEN '${start_date}' AND '${end_date}'`
         ];
         
@@ -2313,35 +2320,6 @@ async function attendanceSummary(employeeId,employee_innerID, date) {
 
         // Nettoyage des attendance_summary
         await deleteUnusedAttendanceSummary(employeeId);
-
-
-        console.log(`✅ Traitement de l'attendance summary terminé pour l'employé ${employeeId} à la date ${date}`);
-    } catch (error) {
-        console.error(`❌ Erreur lors du traitement de l'attendance summary pour l'employé ${employeeId} à la date ${date}:`, error);
-        throw error;
-    }
-}
-
-// Fonction attendance_summary_for_layoff
-async function attendanceSummaryForLayoff(employeeId,employee_innerID, date) {
-    try {
-        console.log(`📅 Traitement de la présence pour l'employé ${employeeId} à la date ${date}`);
-
-        // Appel de la fonction d'initialisation de l'attendance summary
-        await initAttendanceSummary(employeeId, date);
-
-        // Appel de la fonction pour traiter les shifts de travail de l'employé
-        await employeeWorkShift(date, employeeId, employee_innerID);
-
-         // Appel de la fonction pour traiter les indisponibilités de l'employé
-         await employeeUnvailable(date, employeeId, employee_innerID);
-
-         // Appel de la fonction pour vérifier les jours fériés
-         await employeeHoliday(date, employeeId);
-
-        // Mis à jour des Heures d'absence TEST PHASE
-        await processMissedHours(employeeId, date);
-
 
 
         console.log(`✅ Traitement de l'attendance summary terminé pour l'employé ${employeeId} à la date ${date}`);
@@ -4015,6 +3993,7 @@ module.exports = {
     processAllAttendances, 
     processEmployeeAttendance,
     updateAttendanceSummary,
+    processRegularShifts,
     classifyAllPunchesWithLogs,
     processAllNightShifts,
     processMonthlyAttendance,
