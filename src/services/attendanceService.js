@@ -866,7 +866,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         get_holiday = TRUE,
                         nbr_absence = 1,
                         jc_value = 1       
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);
             } else if (layof_type === 'map') {  // pour les mis à pieds
                 await client.query(`
@@ -875,7 +875,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'map',
                         nbr_absence = 1,
                         islayoff = TRUE  
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);
             } else if (layof_type === 'accident') { // pour accident de travail
                 await client.query(`
@@ -884,7 +884,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'accident',
                         nbr_absence = 1,
                         is_accident = TRUE     
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL; 
+                    WHERE employee_id = $1 AND date = $2; 
                 `, [employeeId, date]); 
 
             } else if (layof_type === 'cg_maladie') { // pour congé maladie
@@ -894,7 +894,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'cg_maladie',
                         nbr_absence = 1,
                         is_maladie = TRUE  
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);
             }
             else if (layof_type === 'rdv_medical') { // pour rdv médical, seul effet ( ne perd pas le droit de jour férié )
@@ -904,7 +904,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         status = 'rdv_medical',
                         nbr_absence = 1,
                         get_holiday = TRUE      
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);
             }
             else if (layof_type === 'mission') { // pour les missions, seul effet ( ne perd pas le droit de jour férié )
@@ -916,7 +916,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         missed_hour = 0,
                         penalisable = 0,
                         get_holiday = TRUE      
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);    
             }
             else if (layof_type === 'remote') { // pour les Télétravail, seul effet ( ne perd pas le droit de jour férié )
@@ -928,7 +928,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         missed_hour = 0,
                         penalisable = 0,
                         get_holiday = TRUE      
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);       
 
             } else { // pour les congés exeptionnels 
@@ -940,7 +940,7 @@ async function employeeUnvailable(date, employeeId, employee_innerID) {
                         get_holiday = TRUE,
                         is_congex = TRUE,
                         jcx_value = 1       
-                    WHERE employee_id = $1 AND date = $2 AND getin_ref IS NOT NULL;
+                    WHERE employee_id = $1 AND date = $2;
                 `, [employeeId, date]);
             } 
         } else {
